@@ -128,6 +128,8 @@ input[type=range]{width:100%;accent-color:var(--accent);height:30px;margin:4px 0
 .lh{position:absolute;top:2px;width:44px;height:44px;margin-left:-22px;border-radius:50%;border:2px solid var(--gold);background:#262c55;color:var(--gold);font:800 15px/1 inherit;font-family:inherit;cursor:grab;touch-action:none;padding:0}
 .loopbox.off .lrange{opacity:.4}
 .loopbox .sub b{color:var(--text)}
+.ramp{border-top:1px solid var(--line);margin-top:10px}
+.ramp .set:first-child{padding-top:10px}
 </style>
 </head>
 <body>
@@ -283,12 +285,18 @@ function b64FromBuf(buf){const u=new Uint8Array(buf);let s='';for(let i=0;i<u.le
 function bufFromB64(b){const s=atob(b);const u=new Uint8Array(s.length);for(let i=0;i<s.length;i++)u[i]=s.charCodeAt(i);return u.buffer;}
 
 /* ================= settings ================= */
-const DEFAULTS={speed:100,look:3,wait:false,offset:0,range:'auto',labels:'none',autoOut:'synth',countIn:true};
+const DEFAULTS={speed:100,look:3,wait:false,offset:0,range:'auto',labels:'none',autoOut:'synth',countIn:true,
+  ramp:false,rampFrom:60,rampTo:100,rampStep:5,rampPass:90};
 const S=Object.assign({},DEFAULTS,store.get('pr_settings',{}));
 const SET_DEF={
   speed:{label:'再生速度',type:'range',min:25,max:150,step:5,fmt:v=>v+'%'},
   wait:{label:'練習モード（正しく弾くまで待つ）',type:'check'},
   countIn:{label:'カウントイン（始める前とループで戻るたびに4拍）',type:'check'},
+  ramp:{label:'だんだん速く（区間ループで合格したら、次の回を速くする）',type:'check'},
+  rampFrom:{label:'始める速さ',type:'range',min:25,max:150,step:5,fmt:v=>v+'%'},
+  rampTo:{label:'目標の速さ',type:'range',min:25,max:150,step:5,fmt:v=>v+'%'},
+  rampStep:{label:'上げ幅',type:'seg',opts:[['5','+5%'],['10','+10%']]},
+  rampPass:{label:'合格ライン（正確率）',type:'seg',opts:[['80','80%'],['90','90%'],['95','95%']]},
   look:{label:'画面に表示する長さ（短いほど速く流れる）',type:'range',min:1.5,max:6,step:0.25,fmt:v=>v.toFixed(2).replace(/0$/,'')+'秒'},
   offset:{label:'タイミング補正（判定が遅めに出るなら＋へ）',type:'range',min:-200,max:200,step:5,fmt:v=>(v>0?'+':'')+v+'ms'},
   range:{label:'鍵盤の範囲',type:'seg',opts:[['auto','曲に合わせる'],['88','88鍵']]},
@@ -305,11 +313,13 @@ function syncSettingsUI(){
     else el.querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.v===String(S[k])));});
   document.querySelectorAll('[data-val]').forEach(el=>{const d=SET_DEF[el.dataset.val];el.textContent=d.fmt(S[el.dataset.val]);});
   $('#waitBadge').hidden=!S.wait;
+  document.querySelectorAll('.rampopts').forEach(el=>el.style.display=S.ramp?'':'none');
 }
 function setSetting(k,v){S[k]=v;store.set('pr_settings',S);syncSettingsUI();Game.onSettingChanged(k);}
 document.addEventListener('input',e=>{const el=e.target;if(el.dataset&&el.dataset.set&&el.type==='range')setSetting(el.dataset.set,Number(el.value));});
 document.addEventListener('change',e=>{const el=e.target;if(el.dataset&&el.dataset.set&&el.type==='checkbox')setSetting(el.dataset.set,el.checked);});
-document.addEventListener('click',e=>{const b=e.target.closest('.seg[data-set] button');if(b)setSetting(b.parentElement.dataset.set,b.dataset.v);});
+document.addEventListener('click',e=>{const b=e.target.closest('.seg[data-set] button');if(!b)return;const k=b.parentElement.dataset.set;
+  setSetting(k,typeof DEFAULTS[k]==='number'?Number(b.dataset.v):b.dataset.v);});
 
 /* ================= MIDI file parser (SMF format 0/1) ================= */
 function decodeText(bytes){try{return new TextDecoder('utf-8',{fatal:true}).decode(bytes)}catch(e){try{return new TextDecoder('shift_jis').decode(bytes)}catch(e2){return ''}}}
@@ -538,15 +548,21 @@ const Game={song:null,state:'idle',play:[],auto:[],vis:[],maxDur:0,startT:0,endT
     for(let k=4;k>=1;k--){const t=target-k*b;if(t>=this.t-1e-6)this.clicks.push({t,n:5-k});}},
   setLoop(o){Object.assign(this.loop,o);if(!(this.loop.b>this.loop.a))this.loop.b=Infinity;saveLoop();
     if(this.state==='playing'||this.state==='paused'){
-      if(this.loop.on){this.loopIter=1;this.loopRestart();}
+      if(this.loop.on){if(S.ramp&&S.speed!==S.rampFrom)setSetting('speed',S.rampFrom);this.loopIter=1;this.loopRestart();}
       else{for(const n of this.play)if(n.s>=this.t-1e-4){n.j=null;n.d=0;}this.recount();this.ptr=0;}}
     updateLoopUI();},
   wrapLoop(){const r=this.stats(),c=this.counts,w=this.wrong-this.iterWrong;
-    toast(r.total?(S.wait?`${this.loopIter}回目：弾けた音 ${c.ok}・ミスタッチ ${w}`:`${this.loopIter}回目：正確率 ${(r.acc*100).toFixed(1)}%（MISS ${c.miss}・ミスタッチ ${w}）`):`${this.loopIter}回目`);
-    this.loopIter++;this.loopRestart();},
+    let msg=r.total?(S.wait?`${this.loopIter}回目：弾けた音 ${c.ok}・ミスタッチ ${w}`:`${this.loopIter}回目：正確率 ${(r.acc*100).toFixed(1)}%（MISS ${c.miss}・ミスタッチ ${w}）`):`${this.loopIter}回目`;
+    if(S.ramp&&r.total){ // だんだん速く: pass -> next pass is faster (practice mode: played / (played + wrong keys))
+      const rate=S.wait?(c.ok+w?c.ok/(c.ok+w):0):r.acc;
+      if(rate*100>=S.rampPass-1e-9){if(S.speed<S.rampTo){const nx=Math.min(S.rampTo,S.speed+S.rampStep);msg+=` → 合格！次は ${nx}%`;setSetting('speed',nx);}
+        else msg+=` → 目標の ${S.speed}% で合格！`;}
+      else msg+=` → もう一度 ${S.speed}%`;}
+    toast(msg);this.loopIter++;this.loopRestart();},
   recount(){const c=this.counts={perfect:0,great:0,good:0,ok:0,miss:0};this.deltas=[];
     for(const n of this.play)if(n.j&&n.j!=='skip'){c[n.j]++;if(n.j!=='miss'&&n.j!=='ok')this.deltas.push(n.d);}},
-  start(){if(!this.song)return;Synth.ensure();this.prepare();this.wrong=0;this.maxCombo=0;this.usedWait=S.wait;this.speed=S.speed/100;
+  start(){if(!this.song)return;Synth.ensure();this.prepare();this.wrong=0;this.maxCombo=0;this.usedWait=S.wait;
+    if(this.loop.on&&S.ramp&&S.speed!==S.rampFrom)setSetting('speed',S.rampFrom);this.speed=S.speed/100;
     this.state='playing';
     if(this.loop.on){this.loopIter=1;this.loopRestart();}
     else{this.setPos(this.startT);this.countIn(this.play.length?this.play[0].s:(this.vis.length?this.vis[0].s:null));}
@@ -555,8 +571,11 @@ const Game={song:null,state:'idle',play:[],auto:[],vis:[],maxDur:0,startT:0,endT
   resume(){if(this.state!=='paused')return;Synth.ensure();this.anchorReal=performance.now();this.state='playing';Wake.on();showScreen(null);},
   quit(){this.state='idle';this.stopAuto();Wake.off();this.play=[];this.auto=[];this.vis=[];this.t=0;this.clicks=[];R.layout();updateLoopUI();},
   seekFrac(f){const target=this.startT+(this.endT-this.startT)*clamp(f,0,1);this.setPos(Math.max(this.startT,target-1.5));},
-  onSettingChanged(k){const now=performance.now();
-    if(k==='speed'){if(this.state==='playing'&&!this.frozen){this.anchorSong=this.songTime(now);this.anchorReal=now;}this.speed=S.speed/100;}
+  onSettingChanged(k){const now=performance.now(),live=this.state==='playing'||this.state==='paused';
+    if(k==='speed'){if(this.state==='playing'&&!this.frozen){this.anchorSong=this.songTime(now);this.anchorReal=now;}this.speed=S.speed/100;updateLoopUI();}
+    else if(k==='ramp'){if(S.ramp&&this.loop.on&&live){setSetting('speed',S.rampFrom);this.loopIter=1;this.loopRestart();}else updateLoopUI();}
+    else if(k==='rampFrom'){if(S.rampTo<S.rampFrom)setSetting('rampTo',S.rampFrom);updateLoopUI();}
+    else if(k==='rampTo'){if(S.rampFrom>S.rampTo)setSetting('rampFrom',S.rampTo);updateLoopUI();}
     else if(k==='look'||k==='range'||k==='labels')R.layout();
     else if(k==='wait'){if(S.wait)this.usedWait=true;if(!S.wait&&this.frozen){this.frozen=false;this.anchorReal=now;}}
     else if(k==='autoOut')this.stopAuto();},
@@ -775,7 +794,8 @@ function loadLoop(song){const v=store.get('pr_loops',{})[song.title],sp=songSpan
 function loopHTML(now){return `<div class="loopbox off"><div class="set inline"><span>区間ループ（えらんだ区間をくり返す）</span><label class="sw"><input type="checkbox" data-loop="on"><i></i></label></div>
   <div class="lrange"><canvas></canvas><div class="lsel"></div>${now?'<div class="lpos"></div>':''}<button class="lh" data-h="a" aria-label="区間の始まり">A</button><button class="lh" data-h="b" aria-label="区間の終わり">B</button></div>
   <div class="row between" style="margin-top:8px"><span class="sub" data-loop="info"></span><div class="row">${now?'<button class="btn sec small" data-loopnow="a">いまの位置を A に</button><button class="btn sec small" data-loopnow="b">いまの位置を B に</button>':''}<button class="btn sec small" data-loopnow="all">曲全体に戻す</button></div></div>
-  <p class="hint" style="margin-top:6px">A・B の丸をドラッグして区間をえらびます。青い線は音の多さです。</p></div>`;}
+  <p class="hint" style="margin-top:6px">A・B の丸をドラッグして区間をえらびます。青い線は音の多さです。</p>
+  <div class="ramp">${settingsHTML(['ramp'])}<div class="rampopts">${settingsHTML(['rampFrom','rampTo','rampStep','rampPass'])}</div></div></div>`;}
 function loopNotes(a,b){const sg=Game.song;let n=0;for(const x of sg.notes)if(sg.parts[x.part].mode!=='off'&&x.s>=a-1e-4&&x.s<b-1e-4)n++;return n;}
 function drawDensity(cvs,sg,sp){const w=cvs.clientWidth,h=cvs.clientHeight;if(!w)return;const dpr=Math.min(window.devicePixelRatio||1,2);
   const key=[w,h,sg.notes.length,sg.parts.map(p=>p.mode).join()].join('|');if(cvs._k===key)return;cvs._k=key;
@@ -792,12 +812,13 @@ function updateLoopUI(){const sg=Game.song;if(!sg)return;const sp=songSpan(sg);
     const sel=box.querySelector('.lsel');sel.style.left=fa*100+'%';sel.style.width=(fb-fa)*100+'%';
     box.querySelector('[data-h=a]').style.left=fa*100+'%';box.querySelector('[data-h=b]').style.left=fb*100+'%';
     const pos=box.querySelector('.lpos');if(pos){pos.style.display=Game.state==='paused'?'':'none';pos.style.left=fr(Game.t)*100+'%';}
-    box.querySelector('[data-loop=info]').innerHTML=`A <b>${fmt1(L.a)}</b> → B <b>${isFinite(L.b)?fmt1(L.b):'最後まで'}</b>（${loopNotes(L.a,L.b)}音）`;
+    box.querySelector('[data-loop=info]').innerHTML=`A <b>${fmt1(L.a)}</b> → B <b>${isFinite(L.b)?fmt1(L.b):'最後まで'}</b>（${loopNotes(L.a,L.b)}音）`
+      +(!(S.ramp&&L.on)?'':(Game.state==='playing'||Game.state==='paused')?`・いま <b>${S.speed}%</b> → 目標 ${S.rampTo}%`:`・<b>${S.rampFrom}%</b> から ${S.rampTo}% へ`);
     drawDensity(box.querySelector('canvas'),sg,sp);});
   const band=$('#loopBand'),live=Game.state==='playing'||Game.state==='paused';
   if(L.on&&live&&Game.vis.length){const span=(Game.endT-Game.startT)||1,a=clamp((L.a-Game.startT)/span,0,1),b=clamp(((isFinite(L.b)?L.b:Game.endT)-Game.startT)/span,0,1);
     band.style.display='block';band.style.left=a*100+'%';band.style.width=(b-a)*100+'%';}else band.style.display='none';
-  const bd=$('#loopBadge');bd.hidden=!(Game.loop.on&&live);bd.textContent=`ループ ${Game.loopIter||1}回目`;}
+  const bd=$('#loopBadge');bd.hidden=!(Game.loop.on&&live);bd.textContent=`ループ ${Game.loopIter||1}回目・${S.speed}%`;}
 function commitLoop(a,b,on){const sg=Game.song,sp=songSpan(sg);a=snapOnset(sg,a);
   let bb=b>=sp.e-0.05?Infinity:snapOnset(sg,b);if(!(bb>a+1e-4)){const nx=onsets(sg).find(x=>x>a+1e-4);bb=nx==null?Infinity:nx;}
   Game.setLoop({on,a,b:bb});}

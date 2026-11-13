@@ -272,6 +272,40 @@ with sync_playwright() as pw:
     check('practice + loop: wraps after the notes are played', '弾けた音 3' in page.locator('#toast').inner_text(), page.locator('#toast').inner_text())
     page.evaluate("()=>{__PR.Game.quit();__PR.Game.setLoop({on:false});__PR.setSetting('wait',false);__PR.setSetting('speed',100);}")
 
+    # ---------- だんだん速く (progressive speed-up in the loop) ----------
+    page.evaluate('''()=>{__PR.setSetting('countIn',false);__PR.openSetup(__PR.DEMOS[0].make());__PR.commitLoop(3.0,5.25,true);}''')
+    page.click('#loopSetup .ramp .sw')  # turn on -> options appear
+    vis = page.evaluate("getComputedStyle(document.querySelector('#loopSetup .rampopts')).display")
+    check('ramp: options shown when on', vis != 'none', vis)
+    page.evaluate("()=>{__PR.setSetting('rampFrom',130);__PR.setSetting('rampTo',150);}")
+    page.click('#loopSetup [data-set=rampStep] button[data-v="10"]')
+    page.click('#loopSetup [data-set=rampPass] button[data-v="90"]')
+    st = page.evaluate("()=>({step:__PR.S.rampStep,pass:__PR.S.rampPass,info:document.querySelector('#loopSetup [data-loop=info]').innerText})")
+    check('ramp: seg values stored as numbers; setup shows from -> to', st['step'] == 10 and st['pass'] == 90 and '130% から 150%' in st['info'], st)
+    page.click('#btnStart')
+    sp0 = page.evaluate('__PR.S.speed')
+    check('ramp: starts at the starting speed', sp0 == 130, sp0)
+    page.evaluate('''()=>{const G=__PR.Game,I=__PR.Input;window.__botOn=true;
+      (function bot(){if(G.state!=='playing'&&G.state!=='paused')return;
+        if(window.__botOn&&G.state==='playing'&&!G.frozen){for(const n of G.play){if(n.j===null&&n.s<=G.t){
+          const ts=G.anchorReal+(n.s-G.anchorSong)/G.speed*1000;I.noteOn(n.p,90,ts,'midi');I.noteOff(n.p,'midi');}}}
+        requestAnimationFrame(bot);})();}''')
+    page.wait_for_function('__PR.Game.loopIter>=2', timeout=15000)
+    t1, sp1 = page.locator('#toast').inner_text(), page.evaluate('__PR.S.speed')
+    check('ramp: pass -> next pass is +10%', sp1 == 140 and '合格！次は 140%' in t1, (sp1, t1))
+    page.wait_for_function('__PR.Game.loopIter>=3', timeout=15000)
+    page.wait_for_function('__PR.Game.loopIter>=4', timeout=15000)
+    t3, sp3 = page.locator('#toast').inner_text(), page.evaluate('__PR.S.speed')
+    check('ramp: stays at the target once reached', sp3 == 150 and '目標の 150% で合格' in t3, (sp3, t3))
+    badge = page.locator('#loopBadge').inner_text()
+    check('ramp: badge shows the current speed', '150%' in badge, badge)
+    page.evaluate('()=>{window.__botOn=false;}')  # stop playing -> fail
+    page.wait_for_function('__PR.Game.loopIter>=5', timeout=15000)
+    t4, sp4 = page.locator('#toast').inner_text(), page.evaluate('__PR.S.speed')
+    check('ramp: below the pass line -> same speed again', sp4 == 150 and 'もう一度 150%' in t4, (sp4, t4))
+    page.screenshot(path=SHOTS + '15_ramp_play.png')
+    page.evaluate("()=>{__PR.Game.quit();__PR.Game.setLoop({on:false});__PR.setSetting('ramp',false);__PR.setSetting('speed',100);__PR.setSetting('countIn',true);}")
+
     # ---------- demo songs + 88-key / labels rendering ----------
     for i in range(3):
         info = page.evaluate(f'''()=>{{const s=__PR.DEMOS[{i}].make();return {{title:s.title,n:s.notes.length,dur:+s.dur.toFixed(2),parts:s.parts.map(p=>p.name+':'+p.count+':'+p.hand)}}}}''')
