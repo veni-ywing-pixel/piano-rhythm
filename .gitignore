@@ -1,0 +1,25 @@
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# テストの生成物（tests/make_midi.py が自動生成）
+tests/shots/
+tests/midi/
+tools/video2midi/out/
+
+# 個人の曲・動画はリポジトリに入れない（著作権）
+*.mid
+*.midi
+*.kar
+*.mp4
+*.mkv
+*.webm
+*.mov
+songs/
+videos/

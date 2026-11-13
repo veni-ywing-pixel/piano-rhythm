@@ -1,0 +1,149 @@
+# ピアノリズム — 開発方針（Claude Code 向け）
+
+このファイルは、このリポジトリで作業する Claude Code が最初に読む前提のメモです。目的、現状、設計の要点、守るルール、次にやることを書いています。人間側の作業（GitHub 公開・実機確認）は [docs/SETUP_GUIDE.md](docs/SETUP_GUIDE.md) にあります。
+
+## 1. 目的
+
+電子ピアノを USB-MIDI で入力にした、タブレット向けの「ノーツが降ってくる」リズムゲームを作る。個人で練習したり遊んだりするためのもの。
+
+- 対象端末：Android タブレットの Chrome、横向き
+- 入力：電子ピアノを USB で直結する
+- 譜面：MIDI ファイル。将来は YouTube によくある「鍵盤＋ノーツが降ってくる」動画（Synthesia 風）から MIDI を作る変換ツールを用意する（→ ロードマップ 2）
+
+## 2. 現状（v0.1）
+
+- `index.html` の1ファイルで完結（HTML/CSS/JS、ビルド不要。外部依存は Google Fonts のみで、読めなくても代替フォントで動く）
+- できること
+  - Web MIDI でピアノの入力を受ける（全入力ポートを受信し、チャンネルは無視）。接続状態と「最後に弾いた鍵盤」を表示
+  - MIDI ファイルの読み込み（SMF format 0/1、テンポ変化、SMPTE、ランニングステータス、velocity 0 の note-off、同じ音の再打鍵、Shift-JIS のトラック名）
+  - サンプル曲3つ（ドレミ音階／きらきら星／喜びの歌。どれも著作権の切れた旋律の簡単アレンジ）
+  - 判定（PERFECT/GREAT/GOOD/MISS）、ミスタッチ、コンボ、スコア、ランク
+  - 練習モード（正しく弾くまで止まって待つ。和音は全部そろうまで待つ）
+  - 再生速度 25〜150%、表示秒数（流れる速さ）、タイミング補正、鍵盤範囲（曲に合わせる／88鍵）、音名表示（なし／ドレミ／CDE）
+  - パートごとに「弾く／自動／オフ」の切り替え。プリセット「両手／右手だけ／左手だけ」、1パートの曲を C4 で左右に分割
+  - 「自動」パートの音を鳴らす先：タブレット（WebAudio の簡易音源）／ピアノ（MIDI 出力）／鳴らさない
+  - 一時停止、上部バーのタップで位置移動、結果画面で平均ずれから補正値を提案
+  - 画面の鍵盤のタッチ（マルチタッチ・グリッサンド対応）、PC キーボード（A W S E D F T G Y H U J K O L、Z/X でオクターブ）
+  - 最近開いたファイルを localStorage に最大8件保存（1件 400KB 未満）、プレイ中の画面スリープ防止（Wake Lock）
+- 未確認：実機（Android タブレット＋電子ピアノ）での接続、遅延、描画性能。「自動」パートを MIDI 出力でピアノから鳴らす機能
+- 動画 → MIDI 変換ツール（`tools/video2midi/`、PC 用の Python）：v0.1 ができた（ロードマップ 2）。自前で描いた検証用動画では全ケースで全音一致。実際の YouTube 風の動画では未確認
+
+## 3. ファイル構成
+
+```
+index.html              ゲーム本体（GitHub Pages でそのまま配信する）
+README.md               GitHub のトップに出る説明
+CLAUDE.md               このファイル
+docs/SETUP_GUIDE.md     人間側の作業手順（GitHub 公開・Pages 設定・実機確認・動画の変換）
+tests/run_tests.py      Playwright による E2E／ロジックテスト（37項目）
+tests/make_midi.py      テスト用 MIDI の生成（mido）。run_tests.py が自動で呼ぶ
+tests/requirements.txt  テストの依存（playwright, mido）
+tools/video2midi/       動画 → MIDI 変換ツール（PC 用。OpenCV＋numpy＋mido）。使い方は同じフォルダの README.md
+  video2midi.py           変換の本体（keys 方式／bars 方式、色による左右の分割、MIDI 書き出し）
+  keyboard.py             鍵盤の配置（R.layout と同じ式）、動画からの鍵盤の自動検出、確認画像
+  midi_util.py            MIDI の読み書き。tests/run_tests.py もゲームとの互換確認に使う（mido だけで動く）
+  render_demo.py          MIDI → 検証用の Synthesia 風動画（--style game / alt）
+  make_test_song.py       検証用の練習曲（乱数）
+  evaluate.py             元の MIDI と変換結果の比較（F1、開始時刻の誤差、パートの正解率）
+  test_video2midi.py      描画 → 変換 → 比較のテスト（37項目、QUICK=1 なら 33項目）。出力は tools/video2midi/out/（git 管理外）
+```
+
+## 4. index.html の中身（スクリプトは上から順にこの並び）
+
+| 区分 | 主な名前 | 内容 |
+|---|---|---|
+| ユーティリティ | `nameOf`, `nameToMidi`, `lowerBound`, `store`, `shade`, `toast` | 音名変換、二分探索、localStorage（必ず try/catch）、色計算 |
+| 設定 | `S`, `SET_DEF`, `settingsHTML`, `setSetting` | 設定値は `localStorage['pr_settings']`。同じ設定キーの UI は `data-set` 属性ですべて同期する |
+| MIDI 解析 | `parseMidi`, `finalizeSong`, `splitHands` | パートの単位は（トラック, チャンネル）。ch10 はドラム扱いで既定「オフ」。色は平均音高の高い順に `PALETTE` から割り当て、2パートなら右手・左手を推定 |
+| サンプル曲 | `seq`, `makeSong`, `DEMOS` | 記法：`'C4:1 R:2 C4+E4+G4:2'`（音名:拍数、R は休符、+ は和音） |
+| 音 | `Synth` | WebAudio の簡易ピアノ音。ボイスは `tag:音程` で管理（tag は `touch` か `auto`） |
+| MIDI 入出力 | `MidiIO` | 状態：`idle`/`unsupported`/`blocked`/`denied`/`ok`。iframe 内などで使えないときは Permissions Policy で事前に検知する |
+| 入力 | `Input`, `AutoOut`, `Wake` | ピアノ／タッチ／PC キーボードの入力を `Input.noteOn(p, vel, timeStamp, src)` に集約 |
+| ゲーム | `Game` | 時間管理・判定・自動パート・結果集計（次の節） |
+| 描画 | `R` | Canvas 描画。`layout()` で鍵盤の配置と縦スクロールの速さ（px/秒）を決める |
+| 画面 | `showScreen`, `openSetup`, `renderParts`, `showResult` ほか | 画面は `#home` `#setup` `#pause` `#result` の重ね表示と、上部の HUD |
+| テスト用フック | `window.__PR` | テストが使うので消さないこと |
+
+### 時間モデルと判定（変えるときは慎重に）
+
+- 曲の時刻 `t` は秒（再生速度 100% 基準）。`songTime(real) = anchorSong + (real - anchorReal) / 1000 * speed`。一時停止中と練習モードで止まっている間は `anchorSong` を返す
+- 判定には MIDI イベントの `timeStamp`（`performance.now()` と同じ時計）を使う。描画フレームの時刻ではないので、フレームが落ちても判定はずれない（テストで誤差 0ms を確認済み）
+- 判定の幅は実時間：PERFECT ±45ms／GREAT ±90ms／GOOD ±150ms（`WIN`）。再生速度を変えても体感の厳しさは同じ
+- タイミング補正 `S.offset`（ms）は入力時刻から差し引く。結果画面で「平均ずれ」を出し、ボタン1つで `offset += 平均` にできる
+- 練習モード：最も早い未判定ノートの開始時刻で時間を止め、そこから `CHORD`（0.07 秒）以内に始まる音を全部弾くと再開する。練習モード中はタイミング補正を使わず、判定はすべて `ok`
+- 開始位置 `startT` は最初の音 −（表示秒数＋0.3 秒）、終了 `endT` は最後の音の終わり＋1.2 秒。位置移動はタップした位置の 1.5 秒手前から始め、それより前のノートは `skip`（集計しない）
+- 「自動」ノートは時刻を過ぎたら鳴らす。ただし 0.25 秒以上遅れたものは鳴らさない（位置移動直後の一斉発音を防ぐ）
+
+## 5. 開発ルール
+
+- 当面は `index.html` の1ファイル構成を守る。GitHub Pages にそのまま置けて、タブレットにコピーしても動くようにするため。ビルドツールやフレームワークは入れない。分割したくなったら先にユーザーに相談する
+- 外部 CDN やライブラリを増やさない（オフラインでの練習も考える）
+- UI の文言は日本語。タブレットの横向き（CSS ピクセルで 1333×800 前後）を基準にし、タッチ操作が前提（ボタンの高さは 44px 以上）
+- 変更したら必ず `python tests/run_tests.py` を通す。機能を足したらテストも足す。見た目を変えたら `tests/shots/` のスクリーンショットを確認する
+- `tools/video2midi/` を変えたら `python tools/video2midi/test_video2midi.py` も通す（`QUICK=1` で 1080p60 のケースを省ける）。`midi_util.write_notes` の出力形式を変えたら `tests/run_tests.py` のゲーム互換チェックも確認する
+- 個人の MIDI ファイルや動画をリポジトリに入れない（`.gitignore` で除外済み）。サンプル曲は著作権の切れた旋律だけにする
+- `alert`/`confirm`/`prompt` は使わない（埋め込み表示で止まる）。ダイアログが必要ならページ内に作る
+- コミットは小さく。メッセージは日本語でよい
+
+## 6. 環境の制約（調査・確認済み）
+
+- Web MIDI は Chrome（Android 版を含む）で使える。Chrome 124 以降は MIDI を使うときに許可を求めるダイアログが出る
+- 安全なコンテキスト（HTTPS または localhost）のトップレベルのページが必要。**claude.ai のアーティファクト表示（iframe）では MIDI がブロックされることを実際に確認済み**。このため GitHub Pages で配信する
+- `file://` や Android の `content://` で開いたときに MIDI が使えるかは未確認
+- Android の MIDI は 6.0 以降の標準 API（端末メーカーが有効化するオプション）
+- Android の WebView には Web MIDI がない。ネイティブアプリ化する場合は `android.media.midi` を JS 側へ橋渡しする必要がある
+- USB ホストモード中は USB 経由の adb が使えない（ネイティブ開発ではワイヤレスデバッグを使う）
+
+## 7. ロードマップ（優先順）
+
+### 1. 実機での確認と調整（ユーザーの作業と並行）
+- ユーザーが GitHub Pages で公開し、タブレットの実機で確認する（手順は docs/SETUP_GUIDE.md、結果はチェックリストで届く）
+- 結果に応じて調整する候補：タイミング補正の初期値、描画負荷（`R.layout` の dpr 上限 2.5 を 2 に下げる等）、文字とボタンの大きさ、「自動」パートの MIDI 出力の扱い（ピアノが受け取った音を USB へ送り返す機種だと、ミスタッチとして数えてしまう可能性がある）
+
+### 2. 動画 → MIDI 変換ツール（`tools/video2midi/`）— v0.1 済み
+- できていること（詳細は tools/video2midi/README.md）
+  - 鍵盤の自動検出：中央値フレームで「明暗が細かく入れ替わる行＝黒鍵の段」を探し、左右端・下端・黒鍵の下端を求める。黒鍵の並び（2つ組・3つ組）を白鍵の本数ごとに当てはめて音域を推定（52本なら A0〜C8、それ以外は中央が D4 付近になるオクターブ）。`--range` `--region` で上書きできる。`--check` で確認画像
+  - keys 方式：各鍵の色（白鍵は黒鍵より下、黒鍵は黒鍵部分の中央）を毎フレーム取り、CIELAB の色差のヒステリシス（入 25／切 15）で押鍵区間にする。基準色は各鍵の中央値。ただし同種の鍵の標準色から外れる鍵（押しっぱなしの持続音）は標準色に近いフレームだけで取り直す。時刻は (フレーム ∓ 0.5) / fps
+  - bars 方式：鍵盤の上の帯で背景（中央値）との色差からバーの有無を出し、列ごとにバーの下端・上端を検出。端をフレーム間でつないで落下速度を推定し、各観測を鍵盤上端に届く時刻に換算して集約（フレーム間隔より細かい精度）。黒鍵の列は「幅全体が一様に背景と違う」ことを条件にする（隣の白鍵2本のバーとそのにじみを黒鍵と誤認しないため）
+  - 左右：押されたときの色（a, b と鍵の種類ごとに中心化した L）を k-means。auto なら分離度で 1 か 2 を選ぶ。keys 方式では押鍵中に色が変わったらそこで音を分ける（手の交代）
+  - 書き出し：パートごとに別トラック・別チャンネル、トラック名は UTF-8（右手／左手／ピアノ）、テンポ 120 固定、同じ音程の音は重ならないように詰める。既定で最初の音を 1 秒にそろえる
+- 次にやること
+  - **実際の動画での確認**（ユーザーが手元の動画で試し、SETUP_GUIDE 8 のチェックリストで結果が届く）。結果に応じて、しきい値、黒鍵の位置の式（Synthesia の黒鍵の並びはゲームと違う可能性）、帯の位置の既定値を調整する
+  - 間なしの連打の分離：keys と bars を組み合わせる（バーの縁や継ぎ目で区切る）方式
+  - 必要なら簡単な GUI（鍵盤の範囲をマウスで指定）。今は opencv-python-headless なので画面表示はできない
+  - 長い動画（10分以上・1080p）での処理時間の計測。今は 720p で keys 約 300fps、bars 約 100fps
+- 方針（変えない）：YouTube からのダウンロード機能は組み込まない。既存 OSS のコードを流用するときは先にライセンスを確認する
+
+### 3. ゲームの改善候補
+- 区間ループ（A-B リピート）
+- 長押し（note-off）の判定、サステインペダル（CC64）への対応
+- カウントイン、メトロノーム
+- 曲ライブラリ（IndexedDB に保存。今は localStorage に 8件まで）
+- PWA 化（manifest＋service worker。ホーム画面への追加とオフライン動作。GitHub Pages で動く）
+- 簡単な譜面エディタ（変換ミスを手で直すため）
+- 縦向きのとき、ホーム画面で曲リストが設定より下になる問題
+
+### 4. 必要ならネイティブアプリ化
+- Web 版で遅延や安定性が足りない場合だけ。Kotlin＋`android.media.midi`、または Capacitor＋ネイティブ MIDI プラグイン
+
+## 8. テスト
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r tests/requirements.txt
+python -m playwright install chromium
+python tests/run_tests.py     # 約1分。スクリーンショットは tests/shots/
+```
+
+- `CHROME_PATH` でブラウザを指定できる。`HEADED=1` でブラウザ画面を表示して実行する
+- テストの内容：MIDI 解析（テンポ変化、velocity 0、ランニングステータス、同じ音の再打鍵、Shift-JIS、format 0、ドラム）、ボットによる判定精度、タイミング補正と補正提案、練習モード（和音待ちを含む）、一時停止と位置移動、サンプル曲、左右プリセット、タッチ鍵盤、左右分割、iframe 内での MIDI ブロック検知、変換ツールが書き出す MIDI の読み込み
+- 変換ツールのテスト：`pip install -r tools/video2midi/requirements.txt` のあと `python tools/video2midi/test_video2midi.py`（約3分。ffmpeg があれば H.264 で圧縮した動画で試す）
+- MIDI 機器がない環境でも、`__PR.Input.noteOn(音程, 強さ, timeStamp, 'midi')` で入力を模擬できる。時刻を正確に合わせるなら `timeStamp = Game.anchorReal + (n.s - Game.anchorSong) / Game.speed * 1000`
+
+## 9. 既知の課題
+
+- 実機では未検証
+- 同じ音程の「自動」ノートが重なると、先に終わる側で音が止まる（`Synth` のボイスが音程単位のため）
+- 練習モードのスコアには意味がない（すべて OK 扱い）。結果画面は練習モード用の表示に切り替えている
+- 長い MIDI（数万ノート）での描画性能は未計測
+- 変換ツール：間を空けずに同じ鍵を同じ手で連打すると1つの長い音になる。実際の動画では未検証
