@@ -144,6 +144,7 @@ input[type=search],.song .ren{-webkit-user-select:text;user-select:text;font:inh
   <div id="hudTitle"></div>
   <div id="progress" title="タップで位置を移動"><div id="progressFill"></div><div id="loopBand"></div></div>
   <div id="hudTime">0:00 / 0:00</div>
+  <span class="badge" id="pedalBadge" hidden>ペダル</span>
   <span class="badge" id="loopBadge" hidden>ループ</span>
   <span class="badge" id="waitBadge" hidden>練習モード</span>
   <div id="hudStats">
@@ -289,13 +290,14 @@ function b64FromBuf(buf){const u=new Uint8Array(buf);let s='';for(let i=0;i<u.le
 function bufFromB64(b){const s=atob(b);const u=new Uint8Array(s.length);for(let i=0;i<s.length;i++)u[i]=s.charCodeAt(i);return u.buffer;}
 
 /* ================= settings ================= */
-const DEFAULTS={speed:100,look:3,wait:false,offset:0,range:'auto',labels:'none',autoOut:'synth',countIn:true,
+const DEFAULTS={speed:100,look:3,wait:false,offset:0,range:'auto',labels:'none',autoOut:'synth',countIn:true,hold:true,
   ramp:false,rampFrom:60,rampTo:100,rampStep:5,rampPass:90};
 const S=Object.assign({},DEFAULTS,store.get('pr_settings',{}));
 const SET_DEF={
   speed:{label:'再生速度',type:'range',min:25,max:150,step:5,fmt:v=>v+'%'},
   wait:{label:'練習モード（正しく弾くまで待つ）',type:'check'},
   countIn:{label:'カウントイン（始める前とループで戻るたびに4拍）',type:'check'},
+  hold:{label:'長押しの判定（0.5秒以上の音は、終わり近くまで押さえる）',type:'check'},
   ramp:{label:'だんだん速く（区間ループで合格したら、次の回を速くする）',type:'check'},
   rampFrom:{label:'始める速さ',type:'range',min:25,max:150,step:5,fmt:v=>v+'%'},
   rampTo:{label:'目標の速さ',type:'range',min:25,max:150,step:5,fmt:v=>v+'%'},
@@ -491,7 +493,8 @@ const MidiIO={state:'idle',access:null,inputs:[],outputs:[],lastNote:null,
     for(const inp of this.inputs)inp.onmidimessage=ev=>this.onMessage(ev);renderMidi();},
   onMessage(ev){const d=ev.data;if(!d||d.length<2)return;const ty=d[0]&0xF0;
     if(ty===0x90&&d[2]>0){this.lastNote=d[1];Input.noteOn(d[1],d[2],ev.timeStamp,'midi');scheduleMidiLabel();}
-    else if(ty===0x80||ty===0x90)Input.noteOff(d[1],'midi');},
+    else if(ty===0x80||ty===0x90)Input.noteOff(d[1],'midi',ev.timeStamp);
+    else if(ty===0xB0&&d[1]===64&&d.length>2){this.pedalSeen=true;Input.pedal(d[2]>=64,ev.timeStamp);scheduleMidiLabel();}},
   output(){if(!this.outputs.length)return null;const names=this.inputs.map(i=>i.name);return this.outputs.find(o=>names.includes(o.name))||this.outputs[0];},
   send(bytes){const o=this.output();if(o)try{o.send(bytes)}catch(e){}},
   allNotesOff(){for(const o of this.outputs)try{o.send([0xB0,123,0]);o.send([0xB0,120,0]);}catch(e){}}
@@ -509,13 +512,17 @@ function renderMidi(){
       else{cls='warn';html='許可はOKです。ピアノが見つかりません。USBケーブルとピアノの電源を確認してください（つなぐと自動で認識します）。';}break;
   }
   if(MidiIO.lastNote!=null)html+=`<br><span style="color:var(--muted);font-size:13px">最後に弾いた鍵盤：<b style="color:var(--text)">${nameOf(MidiIO.lastNote)}（${PC_JA[MidiIO.lastNote%12]}）</b></span>`;
+  if(MidiIO.pedalSeen)html+=`<br><span style="color:var(--muted);font-size:13px">ペダル：<b style="color:var(--text)">${Input.pedalDown?'踏んでいる':'離している'}</b></span>`;
   lamp.className='lamp'+(cls?' '+cls:'');msg.innerHTML=html;btn.hidden=!showBtn;
 }
 
 /* ================= input (piano / touch / PC keyboard) ================= */
-const Input={held:new Map(),
-  noteOn(p,vel,ts,src){this.held.set(p,src);if(src!=='midi')Synth.noteOn(p,vel,'touch');Game.onInput(p,ts);},
-  noteOff(p,src){if(this.held.get(p)===src)this.held.delete(p);if(src!=='midi')Synth.noteOff(p,'touch');}};
+const Input={held:new Map(),pedalDown:false,sustained:new Set(),
+  noteOn(p,vel,ts,src){this.held.set(p,src);this.sustained.delete(p);if(src!=='midi')Synth.noteOn(p,vel,'touch');Game.onInput(p,ts);},
+  noteOff(p,src,ts){if(src!=='midi')Synth.noteOff(p,'touch');if(this.held.get(p)!==src)return;this.held.delete(p);
+    if(this.pedalDown)this.sustained.add(p);else Game.onRelease(p,ts);},
+  pedal(down,ts){this.pedalDown=down;$('#pedalBadge').hidden=!(down&&(Game.state==='playing'||Game.state==='paused'));
+    if(!down){for(const p of this.sustained)if(!this.held.has(p))Game.onRelease(p,ts);this.sustained.clear();}}};
 const AutoOut={
   on(p,v){if(S.autoOut==='synth')Synth.noteOn(p,v,'auto');else if(S.autoOut==='midi')MidiIO.send([0x90,p,clamp(v||80,1,127)]);},
   off(p){if(S.autoOut==='synth')Synth.noteOff(p,'auto');else if(S.autoOut==='midi')MidiIO.send([0x80,p,0]);},
@@ -527,9 +534,12 @@ const Wake={lock:null,async on(){try{if('wakeLock' in navigator&&!this.lock){thi
 const WIN={perfect:0.045,great:0.09,good:0.15}; // real-time seconds
 const CHORD=0.07;                                 // song seconds: notes this close count as one chord (practice mode)
 const WEIGHT={perfect:1,great:0.7,good:0.4,ok:1,miss:0};
+const HOLD_MIN=0.5;                               // song seconds: notes at least this long are hold notes (when S.hold)
+const holdTol=n=>Math.max(0.15,0.3*(n.e-n.s));    // releasing this close to the end still counts as held
 const Game={song:null,state:'idle',play:[],auto:[],vis:[],maxDur:0,startT:0,endT:0,
   anchorReal:0,anchorSong:0,frozen:false,speed:1,t:0,ptr:0,autoPtr:0,activeAuto:[],
   counts:{perfect:0,great:0,good:0,ok:0,miss:0},combo:0,maxCombo:0,wrong:0,deltas:[],usedWait:false,
+  holding:new Map(),shortCount:0,shortLoss:0,
   loop:{on:false,a:0,b:Infinity},loopIter:0,iterWrong:0,clicks:[],clickPtr:0,
   songTime(real){if(this.state!=='playing'||this.frozen)return this.anchorSong;return this.anchorSong+(real-this.anchorReal)/1000*this.speed;},
   offSong(){return S.wait?0:S.offset/1000*this.speed;},
@@ -540,8 +550,8 @@ const Game={song:null,state:'idle',play:[],auto:[],vis:[],maxDur:0,startT:0,endT
     const first=this.vis.length?this.vis[0].s:0,last=this.vis.reduce((a,n)=>Math.max(a,n.e),0);
     this.startT=first-Math.max(S.look+0.3,S.countIn?4*beatAt(this.song,first)+0.3:0);this.endT=last+1.2;R.layout();},
   setPos(at){this.t=at;this.anchorSong=at;this.anchorReal=performance.now();this.frozen=false;
-    for(const n of this.play){if(n.s<at-1e-4){if(!n.j)n.j='skip';}else{n.j=null;n.d=0;}}
-    this.markLoop();this.clicks=[];this.clickPtr=0;
+    for(const n of this.play){if(n.s<at-1e-4){if(!n.j)n.j='skip';}else{n.j=null;n.d=0;n.short=false;}}
+    this.holding.clear();this.markLoop();this.clicks=[];this.clickPtr=0;
     this.recount();this.combo=0;this.ptr=0;this.autoPtr=lowerBound(this.auto,at,'s');this.stopAuto();R.clearFx();updateHUD();},
   // ---- A-B loop: notes with a <= s < b are played; the rest are 'skip' (dimmed, not graded) ----
   markLoop(){if(!this.loop.on)return;const {a,b}=this.loop;for(const n of this.play)if(n.s<a-1e-4||n.s>=b-1e-4)n.j='skip';},
@@ -556,24 +566,26 @@ const Game={song:null,state:'idle',play:[],auto:[],vis:[],maxDur:0,startT:0,endT
       else{for(const n of this.play)if(n.s>=this.t-1e-4){n.j=null;n.d=0;}this.recount();this.ptr=0;}}
     updateLoopUI();},
   wrapLoop(){const r=this.stats(),c=this.counts,w=this.wrong-this.iterWrong;
-    let msg=r.total?(S.wait?`${this.loopIter}回目：弾けた音 ${c.ok}・ミスタッチ ${w}`:`${this.loopIter}回目：正確率 ${(r.acc*100).toFixed(1)}%（MISS ${c.miss}・ミスタッチ ${w}）`):`${this.loopIter}回目`;
+    const sh=S.hold&&this.shortCount?`・早く離した ${this.shortCount}`:'';
+    let msg=r.total?(S.wait?`${this.loopIter}回目：弾けた音 ${c.ok}・ミスタッチ ${w}${sh}`:`${this.loopIter}回目：正確率 ${(r.acc*100).toFixed(1)}%（MISS ${c.miss}・ミスタッチ ${w}${sh}）`):`${this.loopIter}回目`;
     if(S.ramp&&r.total){ // だんだん速く: pass -> next pass is faster (practice mode: played / (played + wrong keys))
       const rate=S.wait?(c.ok+w?c.ok/(c.ok+w):0):r.acc;
       if(rate*100>=S.rampPass-1e-9){if(S.speed<S.rampTo){const nx=Math.min(S.rampTo,S.speed+S.rampStep);msg+=` → 合格！次は ${nx}%`;setSetting('speed',nx);}
         else msg+=` → 目標の ${S.speed}% で合格！`;}
       else msg+=` → もう一度 ${S.speed}%`;}
     toast(msg);this.loopIter++;this.loopRestart();},
-  recount(){const c=this.counts={perfect:0,great:0,good:0,ok:0,miss:0};this.deltas=[];
+  recount(){const c=this.counts={perfect:0,great:0,good:0,ok:0,miss:0};this.deltas=[];this.shortCount=0;this.shortLoss=0;
+    for(const n of this.play)if(n.short&&n.j&&n.j!=='skip'){this.shortCount++;this.shortLoss+=WEIGHT[n.j]*0.5;}
     for(const n of this.play)if(n.j&&n.j!=='skip'){c[n.j]++;if(n.j!=='miss'&&n.j!=='ok')this.deltas.push(n.d);}},
   start(){if(!this.song)return;Synth.ensure();this.prepare();this.wrong=0;this.maxCombo=0;this.usedWait=S.wait;
     if(this.loop.on&&S.ramp&&S.speed!==S.rampFrom)setSetting('speed',S.rampFrom);this.speed=S.speed/100;
     this.state='playing';
     if(this.loop.on){this.loopIter=1;this.loopRestart();}
     else{this.setPos(this.startT);this.countIn(this.play.length?this.play[0].s:(this.vis.length?this.vis[0].s:null));}
-    Wake.on();showScreen(null);$('#hudTitle').textContent=this.song.title;updateLoopUI();},
-  pause(){if(this.state!=='playing')return;this.anchorSong=this.songTime(performance.now());this.t=this.anchorSong;this.state='paused';this.stopAuto();Wake.off();showScreen('pause');updateLoopUI();},
+    Wake.on();showScreen(null);$('#hudTitle').textContent=this.song.title;$('#pedalBadge').hidden=!Input.pedalDown;updateLoopUI();},
+  pause(){if(this.state!=='playing')return;this.anchorSong=this.songTime(performance.now());this.t=this.anchorSong;this.holding.clear();this.state='paused';this.stopAuto();Wake.off();showScreen('pause');updateLoopUI();},
   resume(){if(this.state!=='paused')return;Synth.ensure();this.anchorReal=performance.now();this.state='playing';Wake.on();showScreen(null);},
-  quit(){this.state='idle';this.stopAuto();Wake.off();this.play=[];this.auto=[];this.vis=[];this.t=0;this.clicks=[];R.layout();updateLoopUI();},
+  quit(){this.state='idle';this.stopAuto();Wake.off();this.play=[];this.auto=[];this.vis=[];this.t=0;this.clicks=[];this.holding.clear();$('#pedalBadge').hidden=true;R.layout();updateLoopUI();},
   seekFrac(f){const target=this.startT+(this.endT-this.startT)*clamp(f,0,1);this.setPos(Math.max(this.startT,target-1.5));},
   onSettingChanged(k){const now=performance.now(),live=this.state==='playing'||this.state==='paused';
     if(k==='speed'){if(this.state==='playing'&&!this.frozen){this.anchorSong=this.songTime(now);this.anchorReal=now;}this.speed=S.speed/100;updateLoopUI();}
@@ -590,6 +602,7 @@ const Game={song:null,state:'idle',play:[],auto:[],vis:[],maxDur:0,startT:0,endT
     while(this.clickPtr<this.clicks.length&&this.clicks[this.clickPtr].t<=t){const c=this.clicks[this.clickPtr++];if(t-c.t<0.15){Synth.click(c.n===1);R.countText(c.n);}}
     if(!S.wait){const lim=t-this.offSong()-WIN.good*this.speed;for(let i=this.ptr;i<this.play.length&&this.play[i].s<lim;i++){if(!this.play[i].j)this.judge(this.play[i],'miss',0);}this.pendingStart();}
     this.runAuto(t);
+    for(const [p,n] of this.holding)if(t-this.offSong()>=n.e-holdTol(n))this.holding.delete(p); // held long enough
     if(this.loop.on){const lim=Math.min(this.loop.b+this.offSong()+WIN.good*this.speed+0.05,this.endT);
       if(t>=lim&&this.pendingStart()===null)this.wrapLoop();}
     else if(t>=this.endT&&this.pendingStart()===null)this.finish();},
@@ -604,11 +617,16 @@ const Game={song:null,state:'idle',play:[],auto:[],vis:[],maxDur:0,startT:0,endT
     if(best){const delta=(tIn-best.s)/this.speed;let g;
       if(S.wait)g='ok';else{const a=Math.abs(delta);g=a<=WIN.perfect?'perfect':a<=WIN.great?'great':'good';}
       this.judge(best,g,delta);
+      if(S.hold&&best.e-best.s>=HOLD_MIN)this.holding.set(p,best);
       if(S.wait&&this.frozen){const nx=this.pendingStart();if(nx===null||nx>this.anchorSong+CHORD){this.frozen=false;this.anchorReal=performance.now();}}
       return best;}
     // a key matching a dimmed note (outside the loop / before a seek) is not a mistake
     for(let i=lowerBound(this.play,tIn-win,'s');i<this.play.length;i++){const n=this.play[i];if(n.s>tIn+win)break;if(n.j==='skip'&&n.p===p)return null;}
     this.wrong++;R.flash(p,'#ff5d73');return null;},
+  onRelease(p,ts){const n=this.holding.get(p);if(!n)return;this.holding.delete(p);if(this.state!=='playing')return;
+    const now=performance.now();if(!(ts>0)||ts>now+5||now-ts>500)ts=now;
+    const tRel=this.songTime(Math.min(ts,now))-this.offSong();
+    if(tRel<n.e-holdTol(n)){n.short=true;this.shortCount++;this.shortLoss+=WEIGHT[n.j]*0.5;R.judgeText('short');updateHUD();}},
   judge(n,g,d){n.j=g;n.d=d;this.counts[g]++;
     if(g==='miss')this.combo=0;else{this.combo++;if(this.combo>this.maxCombo)this.maxCombo=this.combo;if(g!=='ok')this.deltas.push(d);R.hitFx(n);}
     R.judgeText(g);updateHUD();},
@@ -616,7 +634,7 @@ const Game={song:null,state:'idle',play:[],auto:[],vis:[],maxDur:0,startT:0,endT
     for(let i=this.activeAuto.length-1;i>=0;i--){const n=this.activeAuto[i];if(t>=n.e){AutoOut.off(n.p);this.activeAuto.splice(i,1);}}},
   stopAuto(){for(const n of this.activeAuto)AutoOut.off(n.p);this.activeAuto=[];AutoOut.allOff();},
   stats(){const c=this.counts;const total=this.play.reduce((a,n)=>a+(n.j==='skip'?0:1),0);
-    const judged=c.perfect+c.great+c.good+c.ok+c.miss;const sum=c.perfect*WEIGHT.perfect+c.great*WEIGHT.great+c.good*WEIGHT.good+c.ok*WEIGHT.ok;
+    const judged=c.perfect+c.great+c.good+c.ok+c.miss;const sum=c.perfect*WEIGHT.perfect+c.great*WEIGHT.great+c.good*WEIGHT.good+c.ok*WEIGHT.ok-this.shortLoss;
     return {total,judged,sum,acc:judged?sum/judged:0,score:total?Math.round(sum/total*1e6):0};},
   finish(){this.state='ended';this.stopAuto();Wake.off();showResult();}
 };
@@ -664,13 +682,13 @@ const R={cv:null,c:null,w:0,h:0,dpr:1,lo:36,hi:95,whites:[],ww:20,kx:new Float32
         const bl=isBlack(n.p),pad=bl?1:2,x=this.kx[n.p]+pad,nw=this.kw[n.p]-pad*2;
         const yb=hy-(n.s-t)*pps,yt=hy-(n.e-t)*pps,hh=Math.max(5,yb-yt);
         const hit=n.j&&n.j!=='miss'&&n.j!=='skip';
-        let col=n.j==='miss'?'#535a78':n.color;if(bl&&n.j!=='miss')col=shade(col,-0.22);
+        let col=n.j==='miss'?'#535a78':n.short?'#8a7a62':n.color;if(bl&&n.j!=='miss')col=shade(col,-0.22);
         c.globalAlpha=n.isAuto?0.42:(n.j==='skip'?0.25:1);
         c.fillStyle=col;rr(c,x,yb-hh,nw,hh,Math.min(6,nw/3));c.fill();
         if(hit){c.fillStyle='rgba(255,255,255,0.45)';rr(c,x,yb-hh,nw,hh,Math.min(6,nw/3));c.fill();}
         else if(!n.isAuto&&!n.j){c.fillStyle='rgba(255,255,255,0.22)';c.fillRect(x+2,yb-hh+2,Math.max(1,nw-4),Math.min(3,hh-3));}
         if(S.labels!=='none'&&hh>=fs+6){const lb=this.label(n.p);if(c.measureText(lb).width<=nw-2){c.fillStyle='rgba(8,12,26,.85)';c.fillText(lb,x+nw/2,yb-5);}}
-        if(n.s<=t&&n.e>=t){if(n.isAuto||hit)kf[n.p]=n.color;else if(!n.j&&!kf[n.p])kf[n.p]=shade(n.color,0.45);}
+        if(n.s<=t&&n.e>=t){if(n.isAuto||(hit&&!n.short))kf[n.p]=n.color;else if(!n.j&&!kf[n.p])kf[n.p]=shade(n.color,0.45);}
       }
       c.globalAlpha=1;c.restore();}
     // effects (columns + rings)
@@ -704,7 +722,7 @@ const R={cv:null,c:null,w:0,h:0,dpr:1,lo:36,hi:95,whites:[],ww:20,kx:new Float32
     c.fillStyle='rgba(0,0,0,0.35)';c.fillRect(0,ky,w,3);
     // judgement + combo
     if(this.jt&&Game.state!=='idle'){const k=(now-this.jt.t0);if(k<700){
-      const map={perfect:['PERFECT','#ffd166'],great:['GREAT','#7ee081'],good:['GOOD','#5ec8ff'],miss:['MISS','#ff7a8a'],ok:['OK!','#7ee081']};
+      const map={perfect:['PERFECT','#ffd166'],great:['GREAT','#7ee081'],good:['GOOD','#5ec8ff'],miss:['MISS','#ff7a8a'],ok:['OK!','#7ee081'],short:['SHORT','#ffb84d']};
       const [txt,col]=map[this.jt.g];const sc=k<110?1.25-0.25*(k/110):1;c.globalAlpha=k>450?1-(k-450)/250:1;
       c.font=`800 ${Math.round(38*sc)}px "M PLUS Rounded 1c",sans-serif`;c.textAlign='center';c.fillStyle=col;c.fillText(txt,w/2,hy*0.42);c.globalAlpha=1;}}
     if(this.ct&&Game.state!=='idle'){const k=now-this.ct.t0;if(k<500){ // count-in 1-2-3-4
@@ -833,8 +851,9 @@ function showResult(){const r=Game.stats(),c=Game.counts;
   const rank=practice?'✓':r.acc>=0.95?'S':r.acc>=0.85?'A':r.acc>=0.7?'B':r.acc>=0.5?'C':'D';
   $('#rRank').textContent=r.total?rank:'♪';$('#rTitle').textContent=Game.song.title;$('#rScore').textContent=r.score.toLocaleString();
   $('#rMode').textContent=(practice?'練習モード':'通常モード')+` ・ 再生速度 ${S.speed}% ・ 最大コンボ ${Game.maxCombo}`;
-  const items=practice?[['弾けた音',c.ok+c.perfect+c.great+c.good,'#7ee081'],['MISS',c.miss,'#ff7a8a'],['ミスタッチ',Game.wrong,'#9aa3c7']]
-    :[['PERFECT',c.perfect,'#ffd166'],['GREAT',c.great,'#7ee081'],['GOOD',c.good,'#5ec8ff'],['MISS',c.miss,'#ff7a8a'],['ミスタッチ',Game.wrong,'#9aa3c7']];
+  const items=(practice?[['弾けた音',c.ok+c.perfect+c.great+c.good,'#7ee081'],['MISS',c.miss,'#ff7a8a'],['ミスタッチ',Game.wrong,'#9aa3c7']]
+    :[['PERFECT',c.perfect,'#ffd166'],['GREAT',c.great,'#7ee081'],['GOOD',c.good,'#5ec8ff'],['MISS',c.miss,'#ff7a8a'],['ミスタッチ',Game.wrong,'#9aa3c7']])
+    .concat(S.hold?[['早く離した',Game.shortCount,'#ffb84d']]:[]);
   $('#rCounts').innerHTML=items.map(([k,v,col])=>`<div class="cnt"><small style="color:${col}">${k}</small><b>${v}</b></div>`).join('');
   const tb=$('#rTiming');
   if(!practice&&Game.deltas.length>=8){const mean=Game.deltas.reduce((a,b)=>a+b,0)/Game.deltas.length*1000;const m=Math.round(mean);
@@ -941,9 +960,9 @@ document.addEventListener('keydown',e=>{if(e.target.tagName==='INPUT'&&e.target.
 document.addEventListener('keyup',e=>{const k=e.key.toLowerCase();if(k in KEYMAP)Input.noteOff(kOct+KEYMAP[k],'kbd');});
 
 /* ================= boot ================= */
-$('#setHome').innerHTML=settingsHTML(['speed','wait','countIn','look','offset','range','labels','autoOut']);
-$('#setSetup').innerHTML=settingsHTML(['speed','wait','countIn']);
-$('#setPause').innerHTML=settingsHTML(['speed','wait','countIn','look','offset']);
+$('#setHome').innerHTML=settingsHTML(['speed','wait','countIn','hold','look','offset','range','labels','autoOut']);
+$('#setSetup').innerHTML=settingsHTML(['speed','wait','countIn','hold']);
+$('#setPause').innerHTML=settingsHTML(['speed','wait','countIn','hold','look','offset']);
 $('#loopSetup').innerHTML=loopHTML(false);$('#loopPause').innerHTML=loopHTML(true);
 syncSettingsUI();renderSongList();R.init();MidiIO.init();
 Lib.init().catch(()=>{Lib.mode='ls';Lib.ready=true;}).then(()=>renderSongList());

@@ -117,7 +117,8 @@ with sync_playwright() as pw:
        __PR.openSetup(__PR.parseMidi(u.buffer,'テスト曲'));}''', b64(MID + 'two_tracks.mid'))
     page.wait_for_timeout(200)
     page.screenshot(path=SHOTS + '02_setup.png')
-    page.evaluate('''()=>{__PR.setSetting('wait',false);__PR.setSetting('speed',100);__PR.setSetting('offset',0);__PR.setSetting('labels','ja');}''')
+    # the bots below press and release immediately, so the hold judgement is off until its own tests
+    page.evaluate('''()=>{__PR.setSetting('hold',false);__PR.setSetting('wait',false);__PR.setSetting('speed',100);__PR.setSetting('offset',0);__PR.setSetting('labels','ja');}''')
     page.click('#btnStart')
     # bot: press every RH note exactly on time (timestamp-accurate), skip LH, one wrong key
     page.evaluate('''()=>{const G=__PR.Game,I=__PR.Input;const done=new Set();let wrongDone=false;
@@ -305,6 +306,51 @@ with sync_playwright() as pw:
     check('ramp: below the pass line -> same speed again', sp4 == 150 and 'もう一度 150%' in t4, (sp4, t4))
     page.screenshot(path=SHOTS + '15_ramp_play.png')
     page.evaluate("()=>{__PR.Game.quit();__PR.Game.setLoop({on:false});__PR.setSetting('ramp',false);__PR.setSetting('speed',100);__PR.setSetting('countIn',true);}")
+
+    # ---------- hold (long notes) + sustain pedal ----------
+    # ドレミ音階 notes last 0.675s (>= 0.5s -> hold notes); loop G4 A4 B4
+    page.evaluate('''()=>{__PR.setSetting('hold',true);__PR.setSetting('countIn',false);__PR.setSetting('speed',150);__PR.setSetting('wait',false);
+       __PR.openSetup(__PR.DEMOS[0].make());__PR.commitLoop(3.0,5.25,true);}''')
+    page.click('#btnStart')
+    # G4: released after 0.1s (SHORT) / A4: held to the end / B4: released after 0.1s but the pedal is down until after the end
+    page.evaluate('''()=>{const G=__PR.Game,I=__PR.Input,M=__PR.MidiIO;const at=t=>G.anchorReal+(t-G.anchorSong)/G.speed*1000;
+      const later=(t,fn)=>setTimeout(()=>fn(at(t)),Math.max(0,at(t)-performance.now()));
+      (function bot(){if(G.state!=='playing'||G.loopIter!==1)return;
+        if(!G.frozen)for(const n of G.play){if(n.j===null&&n.s<=G.t){I.noteOn(n.p,90,at(n.s),'midi');
+          if(n.p===67)later(n.s+0.1,ts=>I.noteOff(67,'midi',ts));
+          if(n.p===69)later(n.e,ts=>I.noteOff(69,'midi',ts));
+          if(n.p===71){later(n.s+0.05,ts=>M.onMessage({data:[0xB0,64,127],timeStamp:ts}));later(n.s+0.1,ts=>I.noteOff(71,'midi',ts));
+            later(n.e+0.05,ts=>M.onMessage({data:[0xB0,64,0],timeStamp:ts}));}}}
+        requestAnimationFrame(bot);})();}''')
+    page.wait_for_function('__PR.Input.pedalDown===true', timeout=15000)
+    pb = page.evaluate("!document.querySelector('#pedalBadge').hidden")
+    check('pedal: HUD shows the pedal while it is down', pb)
+    page.screenshot(path=SHOTS + '17_hold.png')
+    page.wait_for_function('__PR.Game.loopIter>=2', timeout=15000)
+    ht = page.locator('#toast').inner_text()
+    check('hold: early release = half score; held / pedal-held notes are fine', '83.3%' in ht and '早く離した 1' in ht, ht)
+    pm = page.locator('#midiMsg').inner_text()
+    check('pedal: shown on the connection panel', 'ペダル：離している' in pm, pm)
+    # releasing a key while paused is not counted
+    page.evaluate('()=>{__PR.Game.quit();__PR.openSetup(__PR.DEMOS[0].make());}')
+    page.click('#btnStart')
+    page.wait_for_function('__PR.Game.t>=3.05', timeout=15000)
+    page.evaluate("()=>{const G=__PR.Game;__PR.Input.noteOn(67,90,G.anchorReal+(3.0-G.anchorSong)/G.speed*1000,'midi');}")
+    h1 = page.evaluate('__PR.Game.holding.size')
+    page.click('#btnPause')
+    page.evaluate("()=>__PR.Input.noteOff(67,'midi')")
+    page.click('#btnResume')
+    h2 = page.evaluate('({short:__PR.Game.shortCount,holding:__PR.Game.holding.size})')
+    check('hold: releasing while paused is not counted', h1 == 1 and h2 == {'short': 0, 'holding': 0}, (h1, h2))
+    # result screen lists early releases
+    page.click('#btnPause')
+    page.click('#loopPause .sw')
+    page.evaluate('()=>__PR.Game.seekFrac(0.93)')
+    page.click('#btnResume')
+    page.wait_for_function("__PR.Game.state==='ended'", timeout=20000)
+    rc = page.locator('#rCounts').inner_text()
+    check('hold: result screen shows 早く離した', '早く離した' in rc, rc)
+    page.evaluate("()=>{__PR.Game.quit();__PR.setSetting('speed',100);__PR.setSetting('countIn',true);}")
 
     # ---------- demo songs + 88-key / labels rendering ----------
     for i in range(3):
