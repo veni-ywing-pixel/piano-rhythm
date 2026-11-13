@@ -94,6 +94,10 @@ input[type=range]{width:100%;accent-color:var(--accent);height:30px;margin:4px 0
 .song .sub{font-size:12px;color:var(--muted)}
 .song .del{border:0;background:transparent;color:var(--muted);font-size:20px;width:40px;height:40px;border-radius:10px;cursor:pointer}
 .listh{font-size:12px;color:var(--muted);margin:14px 0 8px;letter-spacing:.08em}
+input[type=search],.song .ren{-webkit-user-select:text;user-select:text;font:inherit;font-size:15px;color:var(--text);background:rgba(0,0,0,.28);border:1px solid var(--line);border-radius:12px;min-height:44px;padding:0 14px}
+.libq{width:100%;margin-bottom:8px}
+.song .ren{flex:1;min-width:0}
+.song .del.confirm{width:auto;padding:0 12px;background:var(--warn);color:#08101a;font-size:14px;font-weight:800}
 
 /* setup */
 .big{font-size:24px;font-weight:800;margin:4px 0 2px;word-break:break-all}
@@ -720,24 +724,83 @@ function hudTick(){if(Game.state==='idle'||Game.state==='ended')return;const spa
   const cur=Math.max(0,Game.t),tot=Math.max(0,Game.endT-1.2);const txt=fmtTime(cur)+' / '+fmtTime(tot);
   if(hudTick.last!==txt){$('#hudTime').textContent=txt;hudTick.last=txt;}}
 
-// song list
-function getRecent(){return store.get('pr_recent',[]);}
-function addRecent(name,buf){if(buf.byteLength>400000)return;let list=getRecent().filter(r=>r.name!==name);
-  list.unshift({name,data:b64FromBuf(buf),at:Date.now()});list=list.slice(0,8);
-  while(list.length&&!store.set('pr_recent',list))list.pop();}
-function renderSongList(){const el=$('#songList');let html='<div class="listh">サンプル曲</div>';
+// song library: MIDI files the user opened. IndexedDB (no practical limit); falls back to localStorage (8 songs, 400KB each)
+const LIB_MAX_BYTES=10e6;
+function hashBuf(buf){const u=new Uint8Array(buf);let h=0x811c9dc5;for(let i=0;i<u.length;i++){h^=u[i];h=Math.imul(h,0x01000193);}
+  return (h>>>0).toString(16).padStart(8,'0')+'-'+u.length.toString(16);}
+const midiName=n=>String(n).replace(/\.(mid|midi|kar)$/i,'');
+const Lib={mode:'none',ready:false,db:null,list:[],
+  async init(){
+    try{if(window.indexedDB)this.db=await new Promise((res,rej)=>{const rq=indexedDB.open('piano-rhythm',1);
+      rq.onupgradeneeded=()=>{if(!rq.result.objectStoreNames.contains('songs'))rq.result.createObjectStore('songs',{keyPath:'id'});};
+      rq.onsuccess=()=>res(rq.result);rq.onerror=()=>rej(rq.error);rq.onblocked=()=>rej(new Error('blocked'));});}catch(e){this.db=null;}
+    this.mode=this.db?'idb':'ls';
+    try{await this.migrate();}catch(e){}
+    await this.refresh();this.ready=true;},
+  _req(r){return new Promise((res,rej)=>{r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);});},
+  _os(mode){return this.db.transaction('songs',mode).objectStore('songs');},
+  _ls(){return store.get('pr_lib',[]);},
+  async all(){return this.mode==='idb'?this._req(this._os('readonly').getAll()):this._ls();},
+  async get(id){if(this.mode==='idb')return this._req(this._os('readonly').get(id));
+    const r=this._ls().find(x=>x.id===id);return r?{...r,data:bufFromB64(r.data)}:null;},
+  async put(rec){if(this.mode==='idb')return this._req(this._os('readwrite').put(rec));
+    if(rec.data.byteLength>400000)return; // too big for localStorage: the song still opens, it just is not kept
+    let list=[{...rec,data:b64FromBuf(rec.data)},...this._ls().filter(x=>x.id!==rec.id)].sort((a,b)=>b.last-a.last).slice(0,8);
+    while(list.length&&!store.set('pr_lib',list))list.pop();},
+  async del(id){if(this.mode==='idb')return this._req(this._os('readwrite').delete(id));store.set('pr_lib',this._ls().filter(x=>x.id!==id));},
+  async refresh(){this.list=(await this.all()).map(r=>({id:r.id,name:r.name,last:r.last,added:r.added,size:r.size})).sort((a,b)=>b.last-a.last);},
+  async add(fileName,buf,at){if(buf.byteLength>LIB_MAX_BYTES)return null;const id=hashBuf(buf),ex=await this.get(id),now=at||Date.now();
+    const rec=ex?{...ex,last:Math.max(ex.last||0,now)}:{id,name:midiName(fileName),file:String(fileName),data:buf,size:buf.byteLength,added:now,last:now};
+    await this.put(rec);if(!ex)try{navigator.storage&&navigator.storage.persist&&navigator.storage.persist().catch(()=>{});}catch(e){}
+    await this.refresh();return rec;},
+  async touch(id){const r=await this.get(id);if(r){r.last=Date.now();await this.put(r);await this.refresh();}},
+  async rename(id,name){const r=await this.get(id);if(r){r.name=name;await this.put(r);await this.refresh();}},
+  async remove(id){await this.del(id);const L=store.get('pr_loops',{});if(L['lib:'+id]){delete L['lib:'+id];store.set('pr_loops',L);}await this.refresh();},
+  async migrate(){const old=store.get('pr_recent',null);if(!old||!old.length)return; // v0.1 "recent files" -> library
+    for(const r of old.slice().reverse())await this.add(r.name,bufFromB64(r.data),r.at);
+    try{localStorage.removeItem('pr_recent');}catch(e){}}
+};
+let libFilter='',libRen=null,libDel=null,libDelTimer=0;
+function libSub(r){const d=new Date(r.last),L=store.get('pr_loops',{})['lib:'+r.id];
+  return `${d.getMonth()+1}月${d.getDate()}日に練習`+(L&&L.on?'・区間ループあり':'');}
+function renderSongList(keepFocus){const el=$('#songList');let html='<div class="listh">サンプル曲</div>';
   DEMOS.forEach((d,i)=>{html+=`<div class="song" data-demo="${i}"><div class="ic">♪</div><div class="tx"><div class="ttl">${esc(d.title)}</div><div class="sub">${esc(d.sub)}</div></div></div>`;});
-  const rec=getRecent();
-  if(rec.length){html+='<div class="listh">最近開いたファイル</div>';
-    rec.forEach((r,i)=>{html+=`<div class="song" data-recent="${i}"><div class="ic f">♫</div><div class="tx"><div class="ttl">${esc(r.name)}</div><div class="sub">${new Date(r.at).toLocaleDateString('ja-JP')}</div></div><button class="del" data-del="${i}" aria-label="削除">×</button></div>`;});}
-  el.innerHTML=html;}
-$('#songList').addEventListener('click',e=>{
-  const del=e.target.closest('[data-del]');if(del){e.stopPropagation();const list=getRecent();list.splice(+del.dataset.del,1);store.set('pr_recent',list);renderSongList();return;}
-  const it=e.target.closest('.song');if(!it)return;
-  if(it.dataset.demo!=null)openSetup(DEMOS[+it.dataset.demo].make());
-  else{const r=getRecent()[+it.dataset.recent];if(!r)return;try{openSetup(parseMidi(bufFromB64(r.data),r.name.replace(/\.(mid|midi|kar)$/i,'')));}catch(err){toast('読み込めませんでした：'+err.message,'ng');}}});
+  const list=Lib.list,q=libFilter.trim().toLowerCase(),shown=q?list.filter(r=>r.name.toLowerCase().includes(q)):list;
+  html+=`<div class="listh">ライブラリ${Lib.ready?`（${list.length}曲）`:''}${Lib.mode==='ls'?'・この画面では8曲まで':''}</div>`;
+  if(!Lib.ready)html+='<p class="hint" style="margin:0 0 8px">読み込み中…</p>';
+  else if(!list.length)html+='<p class="hint" style="margin:0 0 8px">開いた MIDI ファイルはここに保存され、次からはファイルを選ばずに開けます。</p>';
+  if(list.length>=6||q)html+=`<input type="search" class="libq" placeholder="曲名でしぼりこむ" value="${esc(libFilter)}">`;
+  for(const r of shown){
+    if(libRen===r.id)html+=`<div class="song renbox" data-lib="${esc(r.id)}"><div class="ic f">♫</div><input class="ren" value="${esc(r.name)}" maxlength="80" aria-label="新しい名前"><button class="btn small" data-rensave="${esc(r.id)}">保存</button><button class="btn sec small" data-rencancel>やめる</button></div>`;
+    else html+=`<div class="song" data-lib="${esc(r.id)}"><div class="ic f">♫</div><div class="tx"><div class="ttl">${esc(r.name)}</div><div class="sub">${libSub(r)}</div></div>`
+      +`<button class="del" data-ren="${esc(r.id)}" aria-label="名前を変える">✎</button><button class="del${libDel===r.id?' confirm':''}" data-del="${esc(r.id)}" aria-label="削除">${libDel===r.id?'削除する':'×'}</button></div>`;}
+  if(q&&!shown.length)html+='<p class="hint" style="margin:0">見つかりませんでした。</p>';
+  el.innerHTML=html;
+  const ren=el.querySelector('.ren');if(ren){ren.focus();ren.select();}
+  const sq=el.querySelector('.libq');if(sq&&keepFocus){sq.focus();sq.setSelectionRange(sq.value.length,sq.value.length);}}
+async function saveRename(id){const inp=$('#songList .ren');const v=inp?inp.value.trim():'';if(!v){toast('名前を入れてください','ng');return;}
+  await Lib.rename(id,v);libRen=null;renderSongList();}
+async function openLib(id){try{const r=await Lib.get(id);if(!r)throw new Error('ライブラリに見つかりません');
+    const song=parseMidi(r.data,r.name);song.key='lib:'+id;openSetup(song);Lib.touch(id).then(()=>renderSongList()).catch(()=>{});}
+  catch(err){toast('読み込めませんでした：'+err.message,'ng');}}
+$('#songList').addEventListener('click',async e=>{
+  if(e.target.closest('.ren,.libq'))return;
+  const sv=e.target.closest('[data-rensave]');if(sv){await saveRename(sv.dataset.rensave);return;}
+  if(e.target.closest('[data-rencancel]')){libRen=null;renderSongList();return;}
+  const rn=e.target.closest('[data-ren]');if(rn){libRen=rn.dataset.ren;libDel=null;renderSongList();return;}
+  const del=e.target.closest('[data-del]');if(del){const id=del.dataset.del;clearTimeout(libDelTimer); // 2 taps to delete
+    if(libDel===id){libDel=null;await Lib.remove(id);toast('ライブラリから削除しました');renderSongList();}
+    else{libDel=id;libRen=null;renderSongList();libDelTimer=setTimeout(()=>{libDel=null;renderSongList();},3000);}return;}
+  const it=e.target.closest('.song');if(!it||it.classList.contains('renbox'))return;
+  if(it.dataset.demo!=null)openSetup(DEMOS[+it.dataset.demo].make());else if(it.dataset.lib)openLib(it.dataset.lib);});
+$('#songList').addEventListener('input',e=>{if(e.target.matches('.libq')){libFilter=e.target.value;renderSongList(true);}});
+$('#songList').addEventListener('keydown',e=>{if(!e.target.matches('.ren'))return;
+  if(e.key==='Enter'){e.preventDefault();saveRename(libRen);}else if(e.key==='Escape'){libRen=null;renderSongList();}});
 async function openFile(file){if(!file)return;try{const buf=await file.arrayBuffer();
-    const song=parseMidi(buf,file.name.replace(/\.(mid|midi|kar)$/i,''));addRecent(file.name,buf);renderSongList();openSetup(song);}
+    const song=parseMidi(buf,midiName(file.name));let rec=null;
+    try{rec=await Lib.add(file.name,buf);}catch(e){}
+    if(rec){song.title=rec.name;song.key='lib:'+rec.id;}else if(buf.byteLength>LIB_MAX_BYTES)toast('大きなファイルなのでライブラリには保存しません');
+    renderSongList();openSetup(song);}
   catch(err){toast('読み込めませんでした：'+err.message,'ng');}}
 $('#fileInput').addEventListener('change',e=>{openFile(e.target.files[0]);e.target.value='';});
 const dz=$('#dropZone');
@@ -786,9 +849,9 @@ function showResult(){const r=Game.stats(),c=Game.counts;
 function songSpan(song){return {s:onsets(song)[0]||0,e:song.dur};}
 function fmt1(t){t=Math.max(0,t);const m=Math.floor(t/60),r=t-m*60;return m+':'+(r<10?'0':'')+r.toFixed(1);}
 function saveLoop(){const sg=Game.song;if(!sg)return;const all=store.get('pr_loops',{}),L=Game.loop;
-  all[sg.title]={on:L.on,a:L.a,b:isFinite(L.b)?L.b:null,at:Date.now()};
+  all[sg.key||sg.title]={on:L.on,a:L.a,b:isFinite(L.b)?L.b:null,at:Date.now()};
   for(const k of Object.keys(all).sort((x,y)=>all[y].at-all[x].at).slice(30))delete all[k];store.set('pr_loops',all);}
-function loadLoop(song){const v=store.get('pr_loops',{})[song.title],sp=songSpan(song);
+function loadLoop(song){const all=store.get('pr_loops',{}),v=all[song.key||song.title]||all[song.title],sp=songSpan(song);
   if(v&&v.a>=sp.s-1e-3&&v.a<sp.e)return {on:!!v.on,a:v.a,b:v.b==null?Infinity:v.b};
   return {on:false,a:sp.s,b:Infinity};}
 function loopHTML(now){return `<div class="loopbox off"><div class="set inline"><span>区間ループ（えらんだ区間をくり返す）</span><label class="sw"><input type="checkbox" data-loop="on"><i></i></label></div>
@@ -883,9 +946,10 @@ $('#setSetup').innerHTML=settingsHTML(['speed','wait','countIn']);
 $('#setPause').innerHTML=settingsHTML(['speed','wait','countIn','look','offset']);
 $('#loopSetup').innerHTML=loopHTML(false);$('#loopPause').innerHTML=loopHTML(true);
 syncSettingsUI();renderSongList();R.init();MidiIO.init();
+Lib.init().catch(()=>{Lib.mode='ls';Lib.ready=true;}).then(()=>renderSongList());
 (function loop(){const now=performance.now();Game.tick(now);R.draw();hudTick();requestAnimationFrame(loop);})();
 if(document.fonts&&document.fonts.ready)document.fonts.ready.then(()=>R.layout());
-window.__PR={Game,Input,R,S,parseMidi,openSetup,DEMOS,MidiIO,setSetting,Synth,snapOnset,beatAt,commitLoop};
+window.__PR={Game,Input,R,S,parseMidi,openSetup,DEMOS,MidiIO,setSetting,Synth,snapOnset,beatAt,commitLoop,Lib,renderSongList};
 })();
 </script>
 </body>

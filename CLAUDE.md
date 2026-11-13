@@ -27,7 +27,7 @@
   - カウントイン：曲の始めとループで戻るたびに 4拍のクリック（テンポは MIDI のテンポマップ。設定で ON/OFF）
   - だんだん速く：区間ループで1回ごとに正確率が合格ライン（80/90/95%）以上なら、次の回の再生速度を上げ幅（+5/+10%）だけ上げる。始める速さ〜目標の速さを設定。練習モードでは 弾けた音 ÷（弾けた音＋ミスタッチ）で判定
   - 画面の鍵盤のタッチ（マルチタッチ・グリッサンド対応）、PC キーボード（A W S E D F T G Y H U J K O L、Z/X でオクターブ）
-  - 最近開いたファイルを localStorage に最大8件保存（1件 400KB 未満）、プレイ中の画面スリープ防止（Wake Lock）
+  - 曲ライブラリ：開いた MIDI ファイルを IndexedDB（DB `piano-rhythm`、ストア `songs`）に保存。ID は内容のハッシュ（同じファイルは1曲）。最後に練習した順、6曲以上で絞り込み、名前の変更・2回タップで削除（どちらもページ内）。IndexedDB が使えないときは localStorage `pr_lib` に 8曲・1曲 400KB まで。v0.1 の `pr_recent` は起動時に移す。プレイ中の画面スリープ防止（Wake Lock）
 - 未確認：実機（Android タブレット＋電子ピアノ）での接続、遅延、描画性能。「自動」パートを MIDI 出力でピアノから鳴らす機能
 - 動画 → MIDI 変換ツール（`tools/video2midi/`、PC 用の Python）：v0.1 ができた（ロードマップ 2）。自前で描いた検証用動画では全ケースで全音一致。実際のチュートリアル動画 1本（360p・88鍵）でも keys 方式で 381音を検出し、bars 方式との照合と目視で確認済み
 
@@ -38,7 +38,7 @@ index.html              ゲーム本体（GitHub Pages でそのまま配信す�
 README.md               GitHub のトップに出る説明
 CLAUDE.md               このファイル
 docs/SETUP_GUIDE.md     人間側の作業手順（GitHub 公開・Pages 設定・実機確認・動画の変換）
-tests/run_tests.py      Playwright による E2E／ロジックテスト（57項目）
+tests/run_tests.py      Playwright による E2E／ロジックテスト（69項目）
 tests/make_midi.py      テスト用 MIDI の生成（mido）。run_tests.py が自動で呼ぶ
 tests/requirements.txt  テストの依存（playwright, mido）
 tools/video2midi/       動画 → MIDI 変換ツール（PC 用。OpenCV＋numpy＋mido）。使い方は同じフォルダの README.md
@@ -65,6 +65,7 @@ tools/video2midi/       動画 → MIDI 変換ツール（PC 用。OpenCV＋nump
 | ゲーム | `Game` | 時間管理・判定・自動パート・結果集計（次の節） |
 | 描画 | `R` | Canvas 描画。`layout()` で鍵盤の配置と縦スクロールの速さ（px/秒）を決める |
 | 画面 | `showScreen`, `openSetup`, `renderParts`, `showResult` ほか | 画面は `#home` `#setup` `#pause` `#result` の重ね表示と、上部の HUD |
+| 曲ライブラリ | `Lib`, `renderSongList`, `openLib`, `openFile` | IndexedDB への保存・一覧・名前の変更・削除。曲の `key`（`lib:ID`）で区間ループを保存するので、名前を変えても区間は残る |
 | テスト用フック | `window.__PR` | テストが使うので消さないこと |
 
 ### 時間モデルと判定（変えるときは慎重に）
@@ -127,7 +128,6 @@ tools/video2midi/       動画 → MIDI 変換ツール（PC 用。OpenCV＋nump
 - 長押し（note-off）の判定、サステインペダル（CC64）への対応
 - メトロノーム（曲の間ずっと鳴らす。カウントインはできた）
 - 指番号の表示（MIDI には普通入っていない。自動推定は単純な旋律ならそれらしくなるが、和音や跳躍では外れやすく正解データで確かめにくい。やるなら「推定の目安を表示（初期はオフ）＋譜面エディタで手直し」の順）
-- 曲ライブラリ（IndexedDB に保存。今は localStorage に 8件まで）
 - PWA 化（manifest＋service worker。ホーム画面への追加とオフライン動作。GitHub Pages で動く）
 - 簡単な譜面エディタ（変換ミスを手で直すため）
 - 縦向きのとき、ホーム画面で曲リストが設定より下になる問題
@@ -145,7 +145,7 @@ python tests/run_tests.py     # 約1分。スクリーンショットは tests/s
 ```
 
 - `CHROME_PATH` でブラウザを指定できる。`HEADED=1` でブラウザ画面を表示して実行する
-- テストの内容：MIDI 解析（テンポ変化、velocity 0、ランニングステータス、同じ音の再打鍵、Shift-JIS、format 0、ドラム）、ボットによる判定精度、タイミング補正と補正提案、練習モード（和音待ちを含む）、一時停止と位置移動、サンプル曲、左右プリセット、タッチ鍵盤、左右分割、iframe 内での MIDI ブロック検知、変換ツールが書き出す MIDI の読み込み、区間ループ（音の始まりへのそろえ、くり返し、区間外の音の扱い、ループ解除で最後まで進む、曲ごとの保存、つまみのドラッグ、練習モードとの組み合わせ）、カウントイン（クリックの時刻と回数）、だんだん速く（合格で速くなる・目標で止まる・不合格は同じ速さ）
+- テストの内容：MIDI 解析（テンポ変化、velocity 0、ランニングステータス、同じ音の再打鍵、Shift-JIS、format 0、ドラム）、ボットによる判定精度、タイミング補正と補正提案、練習モード（和音待ちを含む）、一時停止と位置移動、サンプル曲、左右プリセット、タッチ鍵盤、左右分割、iframe 内での MIDI ブロック検知、変換ツールが書き出す MIDI の読み込み、区間ループ（音の始まりへのそろえ、くり返し、区間外の音の扱い、ループ解除で最後まで進む、曲ごとの保存、つまみのドラッグ、練習モードとの組み合わせ）、カウントイン（クリックの時刻と回数）、だんだん速く（合格で速くなる・目標で止まる・不合格は同じ速さ）、曲ライブラリ（保存と再読み込み、同じファイルは1曲、8曲より多く保存、絞り込み、名前の変更と区間ループの引き継ぎ、2回タップの削除、旧データの引き継ぎ、IndexedDB なしでの動作）
 - 変換ツールのテスト：`pip install -r tools/video2midi/requirements.txt` のあと `python tools/video2midi/test_video2midi.py`（約3〜4分。ffmpeg があれば H.264 で圧縮した動画で試す）
 - MIDI 機器がない環境でも、`__PR.Input.noteOn(音程, 強さ, timeStamp, 'midi')` で入力を模擬できる。時刻を正確に合わせるなら `timeStamp = Game.anchorReal + (n.s - Game.anchorSong) / Game.speed * 1000`
 
