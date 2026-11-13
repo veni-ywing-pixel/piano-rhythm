@@ -125,6 +125,20 @@ case('keys_alt_style', song, names, dict(size=(1280, 720), fps=30, style='alt', 
 case('bars_alt_style', song, names, dict(size=(1280, 720), fps=30, style='alt', key_light=False), ['--mode', 'bars'],
      expect=dict(f1=0.98, p95=8, part=0.98))
 
+# ---------- 離したあと光が薄れて消える動画（実際の動画で見つかった）----------
+# 薄れている途中で同じ鍵をまた押す連打も、つながらずに分かれること。音の終わりが伸びないこと
+r, _ = case('keys_fade', song, names, dict(size=(1280, 720), fps=30, fade=0.15),
+            expect=dict(f1=0.99, p95=20, part=0.99))
+if r:
+    check('keys_fade: 音の終わりが光の消える分だけ伸びない（中央値 <= 20ms）', r['offset_abs_median_ms'] <= 20,
+          f'{r["offset_abs_median_ms"]:.1f}ms')
+
+# ---------- 最初に題名の画面、最後にフェードアウトがある動画（--start/--end なしで、その区間を読み飛ばす）----------
+r, log = case('title_fadeout', song, names, dict(size=(1280, 720), fps=30, title=2.0, fadeout=1.0, tail=1.5),
+              expect=dict(range=1, f1=0.99, p95=20, part=0.99))
+check('title_fadeout: 読み飛ばした区間を表示する', '読み飛ばしました' in (log or ''),
+      [ln.strip() for ln in (log or '').splitlines() if '読み飛ばし' in ln])
+
 # ---------- 曲の大半で押されたままの鍵（持続音）も、押されていない色を正しく取る ----------
 held = [Note(48, 0.2, 7.0, 1), Note(48, 7.3, 12.0, 1)]       # 左手 C3 をほぼずっと
 for i in range(24):

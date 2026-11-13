@@ -58,10 +58,12 @@ def fill_rect(img, x0, y0, x1, y1, color, aa=True):
 
 class Renderer:
     def __init__(self, notes, size=(1280, 720), look=3.0, rng=None, colors=None, key_light=True, bars=True,
-                 labels=True, style='game'):
+                 labels=True, style='game', fade=0.0):
         """style: 'game' は index.html と同じ見た目。'alt' はわざと違えた見た目
-        （黒鍵が等間隔・長め、鍵盤の上に赤いフェルト、左右に余白、灰色の背景、光る鍵にグラデーション、バーに縁取り）"""
+        （黒鍵が等間隔・長め、鍵盤の上に赤いフェルト、左右に余白、灰色の背景、光る鍵にグラデーション、バーに縁取り）
+        fade: 離したあと、鍵の光がこの秒数をかけて薄れながら消える（0 ならすぐ消える）"""
         self.notes = sorted(notes, key=lambda n: n.s)
+        self.fade = fade
         self.W, self.H = size
         self.style = style
         lo, hi = rng or auto_range(notes)
@@ -123,11 +125,13 @@ class Renderer:
     def frame(self, t):
         img = self._base.copy()
         kb, hy, pps = self.kb, self.hy, self.pps
-        lit = {}
+        lit, fading = {}, {}
         t_max = t + hy / pps + 0.1
         for n in self.notes:
             if n.s > t_max:
                 break
+            if self.fade and n.e < t <= n.e + self.fade and kb.lo <= n.p <= kb.hi:
+                fading[n.p] = (self.color[n.part], 0.5 * (1 - (t - n.e) / self.fade))
             if n.e < t - 0.02 or n.p < kb.lo or n.p > kb.hi:
                 continue
             bl = is_black(n.p)
@@ -154,6 +158,11 @@ class Renderer:
             fill_rect(img, x, yt, x + nw, yb, c)
             if yb - yt > 6:   # 上の端の明るい線（index.html と同じ飾り）
                 fill_rect(img, x + 2, yt + 2, x + nw - 2, yt + min(5, yb - yt - 3), shade(c, 0.22))
+        if self.key_light:
+            for p, (col, k) in fading.items():      # 消えていく光：鍵の地の色に混ぜる
+                if p not in lit:
+                    base = hex2bgr('#161927') if is_black(p) else hex2bgr('#eef0f7')
+                    lit[p] = base + (col - base) * k
         self._keyboard(img, lit if self.key_light else {})
         return img
 
@@ -192,12 +201,22 @@ class Renderer:
 
 
 def render(notes, out, size=(1280, 720), fps=30, look=3.0, rng=None, colors=None, key_light=True, bars=True,
-           noise=0.0, crf=23, lead=1.0, tail=1.0, seed=0, quiet=False, style='game'):
-    r = Renderer(notes, size, look, rng, colors, key_light, bars, style=style)
-    t0 = -lead - look
+           noise=0.0, crf=23, lead=1.0, tail=1.0, seed=0, quiet=False, style='game', fade=0.0,
+           title=0.0, fadeout=0.0):
+    """title: 最初に題名の画面をこの秒数出し、0.5 秒かけて鍵盤の画面に切り替える
+    fadeout: 最後のこの秒数で黒へフェードアウトする"""
+    r = Renderer(notes, size, look, rng, colors, key_light, bars, style=style, fade=fade)
+    t0 = -lead - look - title
     t1 = max(n.e for n in notes) + tail
     nframes = int(np.ceil((t1 - t0) * fps))
     W, H = size
+    title_img = None
+    if title > 0:
+        title_img = np.full((H, W, 3), (40, 10, 10), np.uint8)
+        fs = H / 220
+        cv2.putText(title_img, 'PIANO TUTORIAL', (int(W * 0.08), int(H * 0.45)), cv2.FONT_HERSHEY_DUPLEX, fs,
+                    (60, 220, 255), max(2, int(fs * 2)), cv2.LINE_AA)
+        cv2.rectangle(title_img, (0, int(H * 0.8)), (W, H), (230, 230, 230), -1)   # 鍵盤に似た明るい帯
     rs = np.random.default_rng(seed)
     # ノイズは毎フレーム作ると遅いので、数枚作っておいて位置をずらしながら使い回す
     noises = [rs.normal(0, noise, (H * 2, W * 2, 3)).astype(np.int16) for _ in range(4)] if noise > 0 else []
@@ -213,7 +232,13 @@ def render(notes, out, size=(1280, 720), fps=30, look=3.0, rng=None, colors=None
         write = lambda b: vw.write(np.frombuffer(b, np.uint8).reshape(H, W, 3))
     for f in range(nframes):
         # 動画の 0 秒 = 曲の t0 秒。変換結果は 0 秒始まりになるので、評価ではずれをまとめて差し引く
-        img = r.frame(t0 + f / fps)
+        vt = f / fps
+        img = r.frame(t0 + vt)
+        if title_img is not None and vt < title + 0.5:
+            k = 0.0 if vt < title else (vt - title) / 0.5
+            img = cv2.addWeighted(title_img, 1 - k, img, k, 0)
+        if fadeout > 0 and vt > (nframes / fps) - fadeout:
+            img = (img * max(0.0, ((nframes / fps) - vt) / fadeout)).astype(np.uint8)
         if noises:
             dy, dx = rs.integers(0, H), rs.integers(0, W)
             nz = noises[f % len(noises)][dy:dy + H, dx:dx + W]
@@ -244,12 +269,13 @@ def main():
     ap.add_argument('--crf', type=int, default=23, help='H.264 の画質（大きいほど粗い）')
     ap.add_argument('--style', choices=['game', 'alt'], default='game',
                     help='見た目。game=ゲームと同じ, alt=黒鍵が等間隔・赤いフェルト・余白などわざと違えたもの')
+    ap.add_argument('--fade', type=float, default=0, help='離したあと鍵の光が薄れて消えるまでの秒数')
     a = ap.parse_args()
     notes, names = load_notes(a.midi)
     W, H = (int(v) for v in a.size.lower().split('x'))
     info = render(notes, a.out, (W, H), a.fps, a.look, parse_range(a.range) if a.range else None,
                   a.colors.split(',') if a.colors else None, not a.no_key_light, not a.no_bars, a.noise, a.crf,
-                  style=a.style)
+                  style=a.style, fade=a.fade)
     print(f'書き出しました: {a.out}（{info["frames"]}フレーム、{info["kb"].describe()}、'
           f'曲の0秒は動画の{-info["t0"]:.2f}秒）')
 

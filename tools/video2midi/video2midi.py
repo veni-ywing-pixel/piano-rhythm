@@ -157,9 +157,9 @@ def keys_pass(video, kb, f0, f1):
     return np.array(idx), to_lab(bgr)
 
 
-def keys_segments(lab, kb, thr_on, thr_off):
-    """各鍵の「押されている区間」を求める。戻り値 [(鍵の番号, 開始, 終了（含まない）)]、基準色、色差"""
-    ref = np.median(lab, axis=0)                     # 押されていない色（各鍵）
+def reference_colors(lab, kb, thr_off):
+    """各鍵の「押されていない色」"""
+    ref = np.median(lab, axis=0)
     # 動画の半分以上押されたままの鍵は、中央値が「押された色」になってしまう。
     # 同じ種類の鍵（白鍵どうし・黒鍵どうし）の標準の色から外れていたら、標準に近いフレームだけで取り直す
     blk = np.array([is_black(p) for p in kb.keys])
@@ -171,17 +171,54 @@ def keys_segments(lab, kb, thr_on, thr_off):
             if np.linalg.norm(ref[k] - g) > thr_off:
                 close = np.linalg.norm(lab[:, k] - g, axis=1) < thr_off
                 ref[k] = np.median(lab[close, k], axis=0) if close.sum() >= 5 else g
+    return ref
+
+
+def keys_segments(lab, kb, thr_on, thr_off, plateau=0.6, max_lit=0.5, pad=3):
+    """各鍵の「押されている区間」を求める。
+
+    戻り値: ([(鍵の番号, 開始, 終了（含まない）)], 基準色, 色差 (F, K), 鍵盤が映っていないフレーム (F,))
+    """
+    ref = reference_colors(lab, kb, thr_off)
     d = np.linalg.norm(lab - ref[None], axis=2)      # (F, K)
+    # 題名の画面・場面の切り替え・フェードアウトなど、鍵盤が映っていないフレームを除く：
+    # 演奏中に白鍵（または黒鍵）の半分以上が同時に光ることはまずないので、そうなったフレーム（と前後 pad フレーム）は
+    # 読み飛ばす。白鍵と黒鍵は別に数える（鍵盤の位置に明るい帯がある画面では、黒鍵だけが外れるため）
+    dev = d > thr_off
+    blk = np.array([is_black(p) for p in kb.keys])
+    hidden = np.zeros(len(d), bool)
+    for sel in (blk, ~blk):
+        if sel.sum() >= 4:
+            hidden |= dev[:, sel].mean(axis=1) > max_lit
+    if hidden.any():
+        hidden = np.convolve(hidden, np.ones(2 * pad + 1), mode='same') > 0
+        if (~hidden).sum() >= 10:
+            ref = reference_colors(lab[~hidden], kb, thr_off)
+            d = np.linalg.norm(lab - ref[None], axis=2)
+        d[hidden] = 0.0
     segs = []
     for k in range(d.shape[1]):
-        cand = d[:, k] > thr_off
-        m = np.concatenate([[False], cand, [False]])
-        dd = np.diff(m.astype(np.int8))
-        for s, e in zip(np.nonzero(dd == 1)[0], np.nonzero(dd == -1)[0]):
+        for s, e in _bool_runs(d[:, k] > thr_off):
             on = np.nonzero(d[s:e, k] > thr_on)[0]
-            if len(on):
-                segs.append((k, s + int(on[0]), e))
-    return segs, ref, d
+            if not len(on):
+                continue
+            s = s + int(on[0])
+            if plateau <= 0:
+                segs.append((k, s, e))
+                continue
+            # 離したあと光が薄れながら消える動画がある。その音の明るさ（上位10%）の plateau 倍より
+            # 弱いフレームは「離している」とみなす：末尾は切り捨て、途中で弱まって戻ったら別の音に分ける
+            seg = d[s:e, k]
+            lvl = max(thr_on, plateau * float(np.percentile(seg, 90)))
+            for a, b in _bool_runs(seg >= lvl):
+                segs.append((k, s + a, s + b))
+    return segs, ref, d, hidden
+
+
+def _bool_runs(mask):
+    m = np.concatenate([[False], np.asarray(mask, bool), [False]])
+    dd = np.diff(m.astype(np.int8))
+    return [(int(s), int(e)) for s, e in zip(np.nonzero(dd == 1)[0], np.nonzero(dd == -1)[0])]
 
 
 # ---------------------------------------------------------------- バー方式（bars）
@@ -357,7 +394,7 @@ def nearest(feats, centers):
 # ---------------------------------------------------------------- 変換の本体
 
 def convert(video, kb, mode='keys', f0=0, f1=None, n_parts='auto', thr=(25.0, 15.0), min_dur=0.05,
-            band=None, pps=None, de_thr=18.0, merge_frames=2):
+            band=None, pps=None, de_thr=18.0, merge_frames=2, plateau=0.6):
     """戻り値: (notes, part_names, 情報 dict)。時刻は動画の先頭からの秒"""
     f1 = video.n if f1 is None or f1 <= 0 else min(f1, video.n)
     fps = video.fps
@@ -366,8 +403,10 @@ def convert(video, kb, mode='keys', f0=0, f1=None, n_parts='auto', thr=(25.0, 15
     raw = []   # dict(k, s, e, lab, [frame_labs])
     if mode == 'keys':
         idx, lab = keys_pass(video, kb, f0, f1)
-        segs, ref, d = keys_segments(lab, kb, *thr)
+        segs, ref, d, hidden = keys_segments(lab, kb, thr[0], thr[1], plateau)
         info['frames'] = len(idx)
+        info['hidden_sec'] = float(hidden.sum() / fps)
+        info['hidden_ranges'] = [(idx[a] / fps, (idx[b - 1] + 1) / fps) for a, b in _bool_runs(hidden)]
         for k, s, e in segs:
             inner = lab[s + 1:e - 1, k] if e - s >= 3 else lab[s:e, k]
             raw.append({'k': k, 'fs': int(idx[s]), 'fe': int(idx[e - 1]), 'lab': np.median(inner, axis=0),
@@ -520,6 +559,8 @@ def main(argv=None):
     ap.add_argument('--parts', default='auto', help='パート（手）の数。auto なら色から 1 か 2 を選ぶ')
     ap.add_argument('--threshold', default='25,15', help='keys: 押鍵とみなす色差（ΔE）の 入り,切れ（既定 25,15）')
     ap.add_argument('--min-dur', type=float, default=0.05, help='これより短い音は捨てる（秒）')
+    ap.add_argument('--plateau', type=float, default=0.6,
+                    help='keys: 押している間の明るさに対してこの割合より弱まったら離したとみなす（光が薄れて消える動画用。0 で無効）')
     ap.add_argument('--band', help='bars: バーを見る帯の 上,下 の y（ピクセル）')
     ap.add_argument('--pps', type=float, help='bars: バーの落ちる速さ（px/秒）。省略すると自動推定')
     ap.add_argument('--keep-time', action='store_true', help='動画の時刻のまま出力する（既定は最初の音を 1 秒にそろえる）')
@@ -550,7 +591,7 @@ def main(argv=None):
         thr = (thr[0], thr[0] * 0.6)
     band = tuple(int(v) for v in a.band.split(',')) if a.band else None
     t_start = time.time()
-    notes, names, info = convert(video, kb, a.mode, f0, f1, a.parts, thr, a.min_dur, band, a.pps)
+    notes, names, info = convert(video, kb, a.mode, f0, f1, a.parts, thr, a.min_dur, band, a.pps, plateau=a.plateau)
     if not notes:
         raise SystemExit('音が見つかりませんでした。--check の画像で位置を確認するか、--mode を変えてみてください')
     shift = 0.0
@@ -561,6 +602,10 @@ def main(argv=None):
             n.e += shift
     write_notes(a.out, notes, names)
     log(f'書き出しました: {a.out}（{time.time() - t_start:.1f} 秒）')
+    if info.get('hidden_ranges'):
+        rs = '、'.join(f'{x:.1f}〜{y:.1f}秒' for x, y in info['hidden_ranges'][:6])
+        log(f'  鍵盤が映っていない区間（題名・フェードなど）を読み飛ばしました: {rs}'
+            + (' ほか' if len(info['hidden_ranges']) > 6 else ''))
     if 'pps' in info:
         log(f'  バーの速さ: {info["pps"]:.1f} px/秒')
     for i, nm in enumerate(names):
