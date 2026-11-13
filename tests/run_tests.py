@@ -199,6 +199,79 @@ with sync_playwright() as pw:
     check('resume works', s7 == 'playing', s7)
     page.evaluate('()=>{__PR.Game.quit();}')
 
+    # ---------- A-B loop + count-in ----------
+    # ドレミ音階: 80bpm (1 beat = 0.75s), RH notes start every 0.75s from 0s
+    page.evaluate('''()=>{localStorage.removeItem('pr_loops');__PR.setSetting('wait',false);__PR.setSetting('speed',150);
+       __PR.setSetting('countIn',true);__PR.openSetup(__PR.DEMOS[0].make());}''')
+    page.evaluate('()=>__PR.commitLoop(3.2,5.1,true)')
+    L = page.evaluate('()=>({...__PR.Game.loop})')
+    check('loop: A/B snap to note starts (3.2->3.0, 5.1->5.25)', abs(L['a'] - 3.0) < 1e-6 and abs(L['b'] - 5.25) < 1e-6 and L['on'], L)
+    info = page.locator('#loopSetup [data-loop=info]').inner_text()
+    check('loop: setup shows range and note count', '0:03.0' in info and '0:05.3' in info and '3音' in info, info)
+    clicks0 = page.evaluate('__PR.Synth.clickCount')
+    page.click('#btnStart')
+    ci = page.evaluate('()=>__PR.Game.clicks.map(c=>+c.t.toFixed(3))')
+    check('count-in: 4 clicks one beat apart ending a beat before A', ci == [0.0, 0.75, 1.5, 2.25], ci)
+    # bot: play every pending note on time; also press a dimmed note (F4 at 2.25s, outside the loop) -> not a mistake
+    page.evaluate('''()=>{const G=__PR.Game,I=__PR.Input;let f4=false;
+      (function bot(){if(G.state!=='playing'&&G.state!=='paused')return;
+        if(G.state==='playing'&&!G.frozen){
+          for(const n of G.play){if(n.j===null&&n.s<=G.t){const ts=G.anchorReal+(n.s-G.anchorSong)/G.speed*1000;I.noteOn(n.p,90,ts,'midi');I.noteOff(n.p,'midi');}}
+          if(!f4&&G.t>=2.25){f4=true;const ts=G.anchorReal+(2.25-G.anchorSong)/G.speed*1000;I.noteOn(65,90,ts,'midi');I.noteOff(65,'midi');}}
+        requestAnimationFrame(bot);})();}''')
+    page.wait_for_function('__PR.Game.loopIter>=2', timeout=20000)
+    toast_txt = page.locator('#toast').inner_text()
+    check('loop: wraps back to A and reports the pass', '1回目' in toast_txt and '100.0%' in toast_txt, toast_txt)
+    page.wait_for_timeout(300)
+    page.screenshot(path=SHOTS + '12_loop_play.png')
+    page.wait_for_function('__PR.Game.loopIter>=3', timeout=20000)
+    st = page.evaluate('''()=>{const G=__PR.Game;return {state:G.state,wrong:G.wrong,clicks:__PR.Synth.clickCount,
+       outsideSkipped:G.play.filter(n=>n.s<2.99||n.s>=5.25-1e-4).every(n=>n.j==='skip'),
+       band:getComputedStyle(document.querySelector('#loopBand')).display,badge:document.querySelector('#loopBadge').textContent}}''')
+    check('loop: keeps looping (no result screen), notes outside are dimmed', st['state'] == 'playing' and st['outsideSkipped'], st)
+    check('loop: pressing a dimmed note is not a mistake', st['wrong'] == 0, st)
+    check('count-in: 4 clicks on each of the first 2 passes', st['clicks'] - clicks0 >= 8, st['clicks'] - clicks0)
+    check('loop: HUD band and badge', st['band'] == 'block' and '3回目' in st['badge'], st)
+
+    # loop off while playing -> continues to the end and shows the result
+    page.click('#btnPause')
+    page.wait_for_timeout(150)
+    page.screenshot(path=SHOTS + '13_loop_pause.png')
+    page.click('#loopPause .sw')  # switch off
+    page.evaluate('()=>__PR.Game.seekFrac(0.93)')
+    page.click('#btnResume')
+    page.wait_for_function("__PR.Game.state==='ended'", timeout=20000)
+    check('loop off: song finishes normally', page.evaluate("document.querySelector('#result').classList.contains('show')"))
+
+    # saved per song
+    page.evaluate('()=>{__PR.Game.quit();__PR.openSetup(__PR.DEMOS[0].make());}')
+    L2 = page.evaluate('()=>({...__PR.Game.loop})')
+    check('loop: range is saved per song', abs(L2['a'] - 3.0) < 1e-6 and abs(L2['b'] - 5.25) < 1e-6 and not L2['on'], L2)
+
+    # drag the A handle on the setup screen
+    rg = page.locator('#loopSetup .lrange').bounding_box()
+    ha = page.locator('#loopSetup [data-h=a]').bounding_box()
+    page.mouse.move(ha['x'] + ha['width'] / 2, ha['y'] + ha['height'] / 2)
+    page.mouse.down()
+    page.mouse.move(rg['x'] + rg['width'] * 0.04, rg['y'] + rg['height'] / 2, steps=6)
+    page.mouse.up()
+    L3 = page.evaluate('()=>({...__PR.Game.loop,onset:__PR.snapOnset(__PR.Game.song,__PR.Game.loop.a)})')
+    check('loop: dragging A turns the loop on and snaps', L3['on'] and L3['a'] < 3.0 and abs(L3['a'] - L3['onset']) < 1e-9, L3)
+    page.screenshot(path=SHOTS + '14_loop_setup.png')
+
+    # practice mode + loop: waits at A, then wraps after the 3 notes are played
+    page.evaluate("()=>{__PR.setSetting('wait',true);__PR.commitLoop(3.0,5.25,true);}")
+    page.click('#btnStart')
+    page.wait_for_function('__PR.Game.frozen', timeout=10000)
+    fz = page.evaluate('__PR.Game.t')
+    check('practice + loop: waits at A', abs(fz - 3.0) < 1e-6, fz)
+    for p in (67, 69, 71):
+        page.wait_for_function('__PR.Game.frozen', timeout=5000)
+        page.evaluate(f'()=>__PR.Input.noteOn({p},90,performance.now(),"midi")')
+    page.wait_for_function('__PR.Game.loopIter>=2', timeout=10000)
+    check('practice + loop: wraps after the notes are played', '弾けた音 3' in page.locator('#toast').inner_text(), page.locator('#toast').inner_text())
+    page.evaluate("()=>{__PR.Game.quit();__PR.Game.setLoop({on:false});__PR.setSetting('wait',false);__PR.setSetting('speed',100);}")
+
     # ---------- demo songs + 88-key / labels rendering ----------
     for i in range(3):
         info = page.evaluate(f'''()=>{{const s=__PR.DEMOS[{i}].make();return {{title:s.title,n:s.notes.length,dur:+s.dur.toFixed(2),parts:s.parts.map(p=>p.name+':'+p.count+':'+p.hand)}}}}''')
